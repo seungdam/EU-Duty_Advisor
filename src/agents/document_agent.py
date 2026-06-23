@@ -32,7 +32,7 @@ from typing import Any
 
 from agents.agent_base import BaseAgent
 from agents.tools import DocumentPackageTool, DomainRouterTool
-from blackboard import BlackboardStore, now_iso
+from agents.blackboard import BlackboardStore, now_iso
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +247,22 @@ class DocumentAgent(BaseAgent):
                 taric10 = target["taric10"]
                 cand_for_target = {**cand, "taric10": taric10}
 
+                # 0. Regulatory domain route from CN/chapter first. The result is
+                # passed into DocumentPackageTool so Supabase pre-TARIC gates can
+                # be queried before post-TARIC measure details are rendered.
+                pre_dom = self._domain_tool.route(
+                    cn8=cn8, product_facts=product_facts, measure_type_hints=[],
+                )
+                product_facts_for_doc = {
+                    **product_facts,
+                    "regulatory_domains": list(pre_dom.domains),
+                    "pre_gate_domains": list(getattr(pre_dom, "pre_gate_domains", []) or []),
+                    "chapter": getattr(pre_dom, "chapter", "") or cn8[:2],
+                }
+
                 # 1. Raw TARIC measure package
                 try:
-                    raw = self._doc_tool.resolve(taric10=taric10)
+                    raw = self._doc_tool.resolve(taric10=taric10, product_facts=product_facts_for_doc)
                 except Exception as e:  # noqa: BLE001
                     self.reason(f"DocumentPackageTool error for {taric10}: {e}")
                     self._emit_unresolved_package(store, cand_for_target, reason=f"tool_error: {e}")
@@ -425,13 +438,31 @@ class DocumentAgent(BaseAgent):
         Document_Agent so the UI can eventually become display-only.
         """
         kr, non_kr, view_controls, view_duties = self._split_requirements_for_view(raw)
-        product_reqs = [r for r in kr if r.get("measure_type") == "Product regulatory requirements"]
+        baseline_reqs = [
+            r for r in kr
+            if r.get("measure_type") == "Baseline document requirements"
+        ]
+        baseline_details = [
+            detail
+            for req in baseline_reqs
+            for detail in (req.get("detailed_requirements") or [])
+        ]
+        product_reqs = [
+            r for r in kr
+            if r.get("measure_type") in (
+                "Product regulatory requirements",
+                "Pre-TARIC screening requirements",
+            )
+        ]
         product_details = [
             detail
             for req in product_reqs
             for detail in (req.get("detailed_requirements") or [])
         ]
-        pre_details = [d for d in product_details if d.get("source_layer") == "chapter_route_seed"]
+        pre_details = [
+            d for d in product_details
+            if d.get("source_layer") in ("pre_taric_gate", "chapter_route_seed")
+        ]
         post_details = [d for d in product_details if d.get("source_layer") == "product_domain_seed"]
         related_declarations = _related_declarations_by_domain(product_reqs, kr)
 
@@ -461,6 +492,7 @@ class DocumentAgent(BaseAgent):
                 "preferential_count": len(preferential_measures),
                 "document_group_count": len(document_groups),
                 "required_document_count": len(required_documents),
+                "baseline_document_count": len(baseline_details),
                 "product_rule_count": len(product_details),
                 "product_pre_count": len(pre_details),
                 "product_post_count": len(post_details),
@@ -491,6 +523,10 @@ class DocumentAgent(BaseAgent):
                 "required_documents": {
                     "agent_bucket": required_documents,
                     "document_groups": document_groups,
+                },
+                "baseline_documents": {
+                    "requirements": baseline_reqs,
+                    "documents": baseline_details,
                 },
                 "product_regulations": {
                     "agent_bucket": product_regulations,

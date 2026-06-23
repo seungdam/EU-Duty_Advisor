@@ -1,10 +1,13 @@
 """
-DomainRouterTool — 제품 → regulatory domain.
+DomainRouterTool — ProductUnderstanding/Classification 전 chapter/domain route.
 
-Owned by Document_Agent. Hybrid design:
+Owned by the pre-classification routing stage and reused by Document_Agent.
+Hybrid design:
 
   1) Deterministic fast-path  ← THIS STEP
+     - cn_chapter_index + domain_scope_routes
      - chapter → 1-2 도메인 매핑 테이블
+     - chapter note decision axes / prepared-food guardrails
      - 명백한 키워드 (예: "lipstick" → cosmetics)
      - 단일 도메인 결과면 그대로 반환
 
@@ -21,6 +24,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Optional
+
+from agents import document_package as _db
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +109,8 @@ _KEYWORD_TO_DOMAIN: list[tuple[re.Pattern, list[str]]] = [
 class DomainRouteResult:
     """One product → one or more applicable regulatory domains."""
     domains: list[str] = field(default_factory=list)            # ["food", "animal_origin"]
+    pre_gate_domains: list[str] = field(default_factory=list)   # ["sanctions", "cites"]
+    chapter: str = ""
     confidence: float = 0.0
     decided_by: str = ""                                        # "fast_path_chapter" | "fast_path_keyword" | "ambiguous" | "llm"
     reason: str = ""
@@ -114,6 +121,8 @@ class DomainRouteResult:
     def to_dict(self) -> dict:
         return {
             "domains": list(self.domains),
+            "pre_gate_domains": list(self.pre_gate_domains),
+            "chapter": self.chapter,
             "confidence": self.confidence,
             "decided_by": self.decided_by,
             "reason": self.reason,
@@ -138,6 +147,110 @@ class DomainRouterTool:
     def __init__(self, llm_adapter=None) -> None:
         self._llm_adapter = llm_adapter
 
+    @staticmethod
+    def _split_values(value: str) -> list[str]:
+        seen: list[str] = []
+        for item in str(value or "").replace("|", ";").replace(",", ";").split(";"):
+            item = item.strip()
+            if item and item not in seen:
+                seen.append(item)
+        return seen
+
+    def _fetch_chapter_row(self, chapter: str) -> dict:
+        conn = None
+        try:
+            conn = _db._connect_db()
+            cur = conn.cursor()
+            if not _db._table_exists(cur, "cn_chapter_index"):
+                cur.close()
+                return {}
+            cur.execute("SELECT * FROM cn_chapter_index WHERE chapter = %s LIMIT 1", (chapter,))
+            cols = [d[0] for d in cur.description]
+            row = cur.fetchone()
+            cur.close()
+            return dict(zip(cols, row)) if row else {}
+        except Exception:
+            return {}
+        finally:
+            _db._release_db(conn)
+
+    def _fetch_domain_routes(self, chapter: str) -> list[dict]:
+        conn = None
+        try:
+            conn = _db._connect_db()
+            cur = conn.cursor()
+            if not _db._table_exists(cur, "domain_scope_routes"):
+                cur.close()
+                return []
+            cur.execute(
+                """
+                SELECT *
+                FROM domain_scope_routes
+                WHERE chapters = 'ALL'
+                   OR %s = ANY(string_to_array(replace(coalesce(chapters, ''), ' ', ''), ';'))
+                ORDER BY domain_scope
+                """,
+                (chapter,),
+            )
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+            cur.close()
+            return rows
+        except Exception:
+            return []
+        finally:
+            _db._release_db(conn)
+
+    def _domains_from_routes(self, chapter: str, chapter_row: dict | None = None) -> tuple[list[str], list[str], list[dict]]:
+        domains: list[str] = []
+        pre_gate_domains: list[str] = []
+        evidence: list[dict] = []
+
+        pre_gate_names = {"sanctions", "cites"}
+        for row in self._fetch_domain_routes(chapter):
+            scope = (row.get("domain_scope") or "").strip()
+            if scope in pre_gate_names:
+                pre_gate_domains.append(scope)
+            else:
+                domains.append(scope)
+            evidence.append({
+                "source": "domain_scope_routes",
+                "domain_scope": scope,
+                "chapter": chapter,
+                "chapters": row.get("chapters") or "",
+                "notes": row.get("notes") or "",
+                })
+
+        if not domains:
+            domains = list(_CHAPTER_TO_DOMAINS.get(chapter, []))
+            if domains:
+                evidence.append({
+                    "source": "fallback_hardcoded_chapter",
+                    "chapter": chapter,
+                    "domains": domains,
+                })
+
+        if not pre_gate_domains:
+            chapter_row = chapter_row or {}
+            pre_gate_domains = self._split_values(chapter_row.get("pre_gate_domain_candidates") or "")
+            if pre_gate_domains:
+                evidence.append({
+                    "source": "cn_chapter_index",
+                    "chapter": chapter,
+                    "pre_gate_domains": pre_gate_domains,
+                })
+        if not pre_gate_domains:
+            pre_gate_domains = ["sanctions"]
+            if chapter in _CITES_CHAPTER_HINTS:
+                pre_gate_domains.append("cites")
+            evidence.append({
+                "source": "fallback_pre_gate",
+                "chapter": chapter,
+                "pre_gate_domains": pre_gate_domains,
+            })
+
+        return domains, pre_gate_domains, evidence
+
     def route(
         self,
         *,
@@ -153,15 +266,27 @@ class DomainRouterTool:
 
         evidence: list[dict] = []
         domains: list[str] = []
+        pre_gate_domains: list[str] = []
 
         # 1. Chapter fast-path
-        chapter_domains = _CHAPTER_TO_DOMAINS.get(chapter, [])
+        chapter_row = self._fetch_chapter_row(chapter)
+        chapter_domains, route_pre_gates, route_evidence = self._domains_from_routes(chapter, chapter_row)
         if chapter_domains:
             domains = list(chapter_domains)
+        if route_pre_gates:
+            pre_gate_domains = list(route_pre_gates)
+        evidence.extend(route_evidence)
+        if chapter_row:
             evidence.append({
-                "source": "fast_path_chapter",
+                "source": "cn_chapter_index",
                 "chapter": chapter,
-                "domains": chapter_domains,
+                "chapter_title": chapter_row.get("chapter_title") or "",
+                "routing_summary": chapter_row.get("routing_summary") or "",
+                "classification_decision_axes": self._split_values(chapter_row.get("classification_decision_axes") or ""),
+                "prepared_food_redirect_chapters": self._split_values(chapter_row.get("prepared_food_redirect_chapters") or ""),
+                "explicit_exclusion_refs": self._split_values(chapter_row.get("explicit_exclusion_refs") or ""),
+                "routing_guardrails": chapter_row.get("routing_guardrails") or "",
+                "source_note_coverage": chapter_row.get("source_note_coverage") or "",
             })
 
         # 2. Keyword override / extension
@@ -182,6 +307,8 @@ class DomainRouterTool:
         if any("cites" in h for h in hints):
             if "cites" not in domains:
                 domains.append("cites")
+            if "cites" not in pre_gate_domains:
+                pre_gate_domains.append("cites")
             evidence.append({"source": "measure_hint", "hint": "CITES"})
         if any("veterinary" in h for h in hints):
             if "animal_origin" not in domains:
@@ -196,6 +323,8 @@ class DomainRouterTool:
         if not domains:
             return DomainRouteResult(
                 domains=["other"],
+                pre_gate_domains=pre_gate_domains,
+                chapter=chapter,
                 confidence=0.2,
                 decided_by="fast_path_unmatched",
                 reason=f"No fast-path rule matched chapter={chapter!r}.",
@@ -214,10 +343,12 @@ class DomainRouterTool:
         decided_by = "fast_path_chapter"
         confidence = 0.8 if not is_ambiguous else 0.5
         reason = (
-            f"chapter {chapter} → {chapter_domains}"
+            f"chapter {chapter} → {domains}"
             + (f"; keyword+={[p.pattern for p,_ in _KEYWORD_TO_DOMAIN if p.search(haystack)]}"
                if any(p.search(haystack) for p,_ in _KEYWORD_TO_DOMAIN) else "")
         )
+        if pre_gate_domains:
+            reason += f"; pre_gate={pre_gate_domains}"
         missing: list[str] = []
         if is_ambiguous:
             missing = ["primary_ingredient_ratio", "animal_origin_content_pct"]
@@ -225,6 +356,8 @@ class DomainRouterTool:
 
         return DomainRouteResult(
             domains=domains,
+            pre_gate_domains=pre_gate_domains,
+            chapter=chapter,
             confidence=confidence,
             decided_by=decided_by,
             reason=reason,

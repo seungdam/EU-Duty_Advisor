@@ -33,6 +33,7 @@ class DocumentPackageTool:
         self,
         *,
         taric10: str,
+        product_facts: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Return the raw DocumentPackage as a dict (dataclass-flattened).
 
@@ -42,6 +43,7 @@ class DocumentPackageTool:
         pkg = _dp.get_document_package(
             taric10,
             include_celex_excerpt=self._include_celex_excerpt,
+            product_facts=product_facts,
         )
         return self._to_dict(pkg)
 

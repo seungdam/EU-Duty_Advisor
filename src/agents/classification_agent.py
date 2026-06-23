@@ -14,6 +14,7 @@ ASAPExpress code is loaded as-is via sys.path — no modifications.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, is_dataclass
 
 from agents._external_classifier import (
@@ -22,7 +23,7 @@ from agents._external_classifier import (
 )
 from agents.agent_base import BaseAgent
 from agents.tools import TaricBranchResolverTool
-from blackboard import BlackboardStore, now_iso
+from agents.blackboard import BlackboardStore, now_iso
 
 
 def _read_field(obj, *names, default=None):
@@ -50,7 +51,7 @@ def _read_field(obj, *names, default=None):
 class ClassificationAgent(BaseAgent):
     agent_name = "Classification_Agent"
     stage = "Classification"
-    llm_model = "gemma4:26b"  # actual model selected by bridge.RuntimeAdapter
+    llm_model = os.environ.get("EU_EXPORT_LLM_MODEL", "gemma4-ctx")
 
     def __init__(self) -> None:
         super().__init__()

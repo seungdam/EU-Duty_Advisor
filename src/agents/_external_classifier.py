@@ -28,6 +28,126 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+LLM_CANDIDATE_DESC_CHARS = _read_positive_int_env(
+    "ASAP_CLASSIFIER_CANDIDATE_DESC_CHARS",
+    180,
+)
+LLM_CANDIDATE_BRANCH_CHARS = _read_positive_int_env(
+    "ASAP_CLASSIFIER_CANDIDATE_BRANCH_CHARS",
+    120,
+)
+LLM_PRODUCT_TEXT_CHARS = _read_positive_int_env(
+    "ASAP_CLASSIFIER_PRODUCT_TEXT_CHARS",
+    1400,
+)
+LLM_DECISION_MAX_TOKENS = _read_positive_int_env(
+    "ASAP_CLASSIFIER_DECISION_MAX_TOKENS",
+    384,
+)
+
+ALLERGEN_TERMS = (
+    "우유",
+    "메밀",
+    "땅콩",
+    "대두",
+    "밀",
+    "고등어",
+    "게",
+    "새우",
+    "돼지고기",
+    "복숭아",
+    "토마토",
+    "아황산류",
+    "호두",
+    "닭고기",
+    "쇠고기",
+    "오징어",
+    "조개류",
+    "굴",
+    "전복",
+    "홍합",
+    "잣",
+    "계란",
+    "난류",
+)
+ALLERGEN_DECLARATION_RE = re.compile(
+    r"(?:(?:"
+    + "|".join(re.escape(term) for term in sorted(ALLERGEN_TERMS, key=len, reverse=True))
+    + r")(?:\s*\([^)]*\))?\s*[,·./、및 ]+\s*){1,}"
+    r"(?:"
+    + "|".join(re.escape(term) for term in sorted(ALLERGEN_TERMS, key=len, reverse=True))
+    + r")(?:\s*\([^)]*\))?\s*함유"
+)
+ALLERGEN_NOTICE_MARKERS = (
+    "알레르기",
+    "알러지",
+    "알레르겐",
+    "혼입",
+    "혼입가능",
+    "혼입 가능",
+    "같은 제조시설",
+    "같은 제조 시설",
+    "제조시설에서 제조",
+    "사용한 제품과 같은",
+    "may contain",
+    "same facility",
+    "same manufacturing",
+    "allergen",
+    "allergy",
+)
+
+
+def _strip_allergen_notice_text(text: str) -> str:
+    """Remove allergen/cross-contact notices from classifier evidence text.
+
+    Allergen declarations are labelling and safety evidence, not composition
+    evidence for CN selection. Keep ingredient lines, but strip trailing
+    declarations such as "밀,대두,계란 함유" and drop cross-contact lines.
+    """
+    normalized = str(text or "")
+    if not normalized.strip():
+        return ""
+    lowered = normalized.lower()
+    if any(marker in lowered for marker in ALLERGEN_NOTICE_MARKERS):
+        return ""
+    stripped = ALLERGEN_DECLARATION_RE.sub("", normalized)
+    return re.sub(r"[,\s·./、]+$", "", stripped).strip()
+
+
+def _clean_classifier_fact_texts(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        values = [str(values)] if str(values or "").strip() else []
+    cleaned: list[str] = []
+    for value in values:
+        text = _strip_allergen_notice_text(str(value))
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+def _clean_classifier_ocr_text(value: Any) -> str:
+    raw = str(value or "")
+    if not raw.strip():
+        return ""
+    lines = []
+    for line in raw.splitlines():
+        cleaned = _strip_allergen_notice_text(line)
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines)
+
+
 def _copy_with_clamped_max_tokens(request: Any, max_tokens: int) -> Any:
     """Return a copy of ``request`` whose generationOptions.maxTokens == max_tokens.
 
@@ -95,8 +215,8 @@ def _build_candidate_contract(candidates: Sequence[Any]) -> list[dict[str, Any]]
         contract.append({
             "hs8": hs8,
             "hs6_code": _candidate_code(candidate, "hs6Code") or None,
-            "cn8_description": str(description)[:300],
-            "branch_context": str(branch_context)[:240],
+            "cn8_description": str(description)[:LLM_CANDIDATE_DESC_CHARS],
+            "branch_context": str(branch_context)[:LLM_CANDIDATE_BRANCH_CHARS],
             "path_codes": {
                 "hs2": _candidate_code(candidate, "hs2Code") or None,
                 "hs4": _candidate_code(candidate, "hs4Code") or None,
@@ -242,12 +362,6 @@ def _build_compact_decision_request(
     candidates: Sequence[Any],
 ) -> Any:
     candidate_contract = _build_candidate_contract(candidates)
-    structured_facts = list(getattr(product_input, "structuredProductFacts", []) or [])
-    unresolved_facts = list(getattr(product_input, "unresolvedProductFacts", []) or [])
-    fact_conflicts = list(getattr(product_input, "productFactConflicts", []) or [])
-    classification_fact_texts = list(
-        getattr(product_input, "normalizedOcrFactTexts", []) or []
-    )
     compact_shape = {
         "selected_hs8": "one exact candidate hs8 or null",
         "candidate_reviews": [
@@ -274,31 +388,12 @@ def _build_compact_decision_request(
         "Do not select an ingredient-specific candidate unless that ingredient or condition is explicit in the product facts.",
         "For example, `Containing eggs` requires explicit egg/난/albumen/egg powder evidence; fish/meat/stuffed candidates require explicit matching evidence and percentage conditions.",
         "For instant ramen/noodle products described as 유탕면/라면/dried noodles with wheat flour and no explicit egg/stuffed/fish/meat percentage condition, prefer the dry/other noodle candidate over egg/stuffed/meat/fish candidates.",
-        "Use structured_product_facts_json as the primary product facts for candidate review.",
-        "classification_fact_texts_json is only a retrieval/search fallback view of the same input; do not prefer it over structured_product_facts_json.",
-        "Do not infer facts that are not explicitly present in structured_product_facts_json.",
-        "Use product type, physical form, processing state, storage state, ingredients, composition ratios, content weight, and origin facts when they are explicit.",
-        "Do not treat allergen warnings, cross-contamination warnings, or same-facility statements as proof that the allergen is a main ingredient or satisfies an ingredient-specific CN condition.",
-        "If a fact line appears contradictory or looks like OCR/reconstruction noise, mark the affected candidate as possible_candidate or insufficient_information instead of forcing a strong_candidate.",
         "Allowed status values: strong_candidate, possible_candidate, unlikely_candidate, insufficient_information.",
         "Review the strongest few candidates; unreviewed candidates will be filled deterministically as unlikely/insufficient.",
         "product_name: {0}".format(product_input.productName or "unknown"),
         "product_domain: {0}".format(product_input.productDomain),
-        "classification_fact_count: {0}".format(
-            len(classification_fact_texts)
-        ),
-        "structured_product_facts_json:",
-        json.dumps(structured_facts[:60], ensure_ascii=False, separators=(",", ":")),
-        "unresolved_product_facts_json:",
-        json.dumps(unresolved_facts[:20], ensure_ascii=False, separators=(",", ":")),
-        "product_fact_conflicts_json:",
-        json.dumps(fact_conflicts[:20], ensure_ascii=False, separators=(",", ":")),
-        "classification_fact_texts_json:",
-        json.dumps(
-            classification_fact_texts[:80],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
+        "product_text:",
+        product_input.BuildSearchText()[:LLM_PRODUCT_TEXT_CHARS],
         "candidate_contract:",
         json.dumps(candidate_contract, ensure_ascii=False, separators=(",", ":")),
         "required_output_shape:",
@@ -372,12 +467,12 @@ def _apply_domain_selection_guard(
     """Correct obvious local-LLM slips before Stage1 validator expansion."""
     candidate_codes = {item["hs8"] for item in _build_candidate_contract(candidates)}
     text = (product_input.BuildSearchText() or "").lower()
-    if (
-        "19023010" in candidate_codes
-        and any(token in text for token in ("라면", "ramen", "instant noodle", "유탕면"))
-        and not any(token in text for token in ("계란", "egg", "난백", "albumen"))
-        and not any(token in text for token in ("stuffed", "filled pasta"))
-    ):
+    ramen_like = any(
+        token in text
+        for token in ("라면", "ramen", "ramyun", "instant noodle", "유탕면")
+    )
+    stuffed_or_filled = any(token in text for token in ("stuffed", "filled pasta"))
+    if "19023010" in candidate_codes and ramen_like and not stuffed_or_filled:
         out = dict(compact)
         out["selected_hs8"] = "19023010"
         reviews = [
@@ -390,8 +485,8 @@ def _apply_domain_selection_guard(
             "status": "strong_candidate",
             "reason": (
                 "Domain guard: ramen/유탕면 evidence indicates dried/other "
-                "noodles; no explicit egg, stuffed, fish, or meat percentage "
-                "condition was provided."
+                "noodles under pasta/noodle heading rather than couscous or "
+                "stuffed pasta."
             ),
             "supporting_product_facts": [
                 "Product facts contain 라면/유탕면 and wheat-flour noodle evidence."
@@ -547,8 +642,8 @@ for _path in (ASAP_PROJECT_ROOT, ASAP_SRC_ROOT):
     if _path.exists() and str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from eu_export.app_config import LoadAppConfig
-from eu_export.bridge import (
+from bussiness_logic.app_config import LoadAppConfig
+from bussiness_logic.bridge import (
     BuildDefaultLlmRuntimeConfig,
     BuildLlmRuntimeConfigFromEnv,
     BuildRuntimeAdapter,
@@ -559,7 +654,7 @@ from eu_export.bridge import (
     TextEmbeddingAdapterBuildError,
     TextEmbeddingGenerationError,
 )
-from eu_export.core import (
+from bussiness_logic.core import (
     CnCandidateRetriever,
     CnSemanticCandidateIndex,
     OntologyContextBuilder,
@@ -572,6 +667,12 @@ from eu_export.core import (
     Stage1TraversalController,
 )
 
+try:
+    from agents.document_package import _connect_db, _release_db
+except Exception:  # pragma: no cover - classifier can still import without DB.
+    _connect_db = None
+    _release_db = None
+
 
 APP_CONFIG = LoadAppConfig(ASAP_PROJECT_ROOT)
 ASAP_ONTOLOGY_ROOT = APP_CONFIG.paths.ResolvePath(
@@ -581,6 +682,41 @@ ASAP_ONTOLOGY_ROOT = APP_CONFIG.paths.ResolvePath(
 ASAP_ENV_FILE = ASAP_PROJECT_ROOT / ".env"
 SEMANTIC_CANDIDATE_INDEX: CnSemanticCandidateIndex | None = None
 SEMANTIC_CANDIDATE_INDEX_STATUS: dict[str, Any] | None = None
+
+
+class SupabaseCnCandidateRetriever(CnCandidateRetriever):
+    """CnCandidateRetriever backed by Supabase cn_table, not local CSV files."""
+
+    def _LoadRowsByDomainScope(self) -> dict[str, list[dict[str, str]]]:
+        if self._rowsByDomainScope is not None:
+            return self._rowsByDomainScope
+        if _connect_db is None or _release_db is None:
+            raise RuntimeError("Supabase DB connector is not available.")
+
+        conn = _connect_db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM cn_table")
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+            cur.close()
+        finally:
+            _release_db(conn)
+
+        rows_by_domain_scope: dict[str, list[dict[str, str]]] = {
+            "food_16_21": [],
+            "cosmetics": [],
+        }
+        for row in rows:
+            normalized = {str(k): "" if v is None else str(v) for k, v in row.items()}
+            chapter = (normalized.get("chapter", "") or normalized.get("hs2_code", "")).zfill(2)
+            if chapter in {"16", "17", "18", "19", "20", "21"}:
+                rows_by_domain_scope["food_16_21"].append(normalized)
+            if chapter in {"32", "33"}:
+                rows_by_domain_scope["cosmetics"].append(normalized)
+
+        self._rowsByDomainScope = rows_by_domain_scope
+        return rows_by_domain_scope
 
 
 # ---------------------------------------------------------------------------
@@ -707,41 +843,15 @@ def pes_to_input(pes: dict, *, domain_scope: str = "food_16_21") -> ProductClass
         ocr_text = "\n".join(str(t) for t in ocr_chunks if t)
     else:
         ocr_text = str(ocr_chunks)
-    composition = (
-        obs.get("classification_input_fact_texts")
-        or obs.get("classification_fact_texts")
-        or obs.get("composition")
-        or []
-    )
-    if not isinstance(composition, list):
-        composition = [str(composition)] if str(composition).strip() else []
-    structured_product_facts = (
-        obs.get("classification_input_product_facts")
-        or obs.get("structured_product_facts")
-        or []
-    )
-    if not isinstance(structured_product_facts, list):
-        structured_product_facts = []
-    unresolved_product_facts = obs.get("unresolved_product_facts") or []
-    if not isinstance(unresolved_product_facts, list):
-        unresolved_product_facts = []
-    product_fact_conflicts = obs.get("product_fact_conflicts") or []
-    if not isinstance(product_fact_conflicts, list):
-        product_fact_conflicts = [product_fact_conflicts]
+    ocr_text = _clean_classifier_ocr_text(ocr_text)
+    composition = _clean_classifier_fact_texts(obs.get("composition") or [])
 
     return ProductClassificationInput(
         productName=obs.get("product_name") or "",
         shortDescription=obs.get("description") or "",
         productDomain=domain_scope,
         domainScopes=[domain_scope],
-        normalizedOcrFactTexts=[str(t) for t in composition if str(t).strip()],
-        structuredProductFacts=[
-            dict(item) for item in structured_product_facts if isinstance(item, dict)
-        ],
-        unresolvedProductFacts=[
-            dict(item) for item in unresolved_product_facts if isinstance(item, dict)
-        ],
-        productFactConflicts=product_fact_conflicts,
+        normalizedOcrFactTexts=composition,
         ocrText=ocr_text,
     )
 
@@ -759,7 +869,7 @@ def run_external_classifier(
     productInput = pes_to_input(pes, domain_scope=domain_scope)
 
     # 2. Retrieval
-    retriever = CnCandidateRetriever(ASAP_ONTOLOGY_ROOT, ASAP_PROJECT_ROOT)
+    retriever = SupabaseCnCandidateRetriever(ASAP_ONTOLOGY_ROOT, ASAP_PROJECT_ROOT)
     semanticIndex, semanticStatus = build_semantic_candidate_index(retriever)
     if semanticIndex is None:
         candidates = retriever.FindCandidates(productInput, topK=top_k_candidates)
@@ -822,7 +932,7 @@ def run_external_classifier(
     request = _copy_with_clamped_max_tokens(request, LLM_MAX_TOKENS)
     request = _harden_stage1_request(request, productInput, candidates)
     request = _build_compact_decision_request(request, productInput, candidates)
-    request = _copy_with_clamped_max_tokens(request, 768)
+    request = _copy_with_clamped_max_tokens(request, LLM_DECISION_MAX_TOKENS)
     prompt_text = (request.systemPrompt or "") + "\n---\n" + (request.userPrompt or "")
 
     # 6. LLM call

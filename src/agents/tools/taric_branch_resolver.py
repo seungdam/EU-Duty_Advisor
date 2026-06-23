@@ -5,8 +5,7 @@ Owned by Classification_Agent. Pure deterministic lookup — no LLM. The Agent
 calls this to enumerate the deterministic universe of TARIC10 lines under a
 CN8 before asking the LLM to rank/select one.
 
-Data source: ``data/processed/TARIC/taric_master_table.csv`` (140k rows).
-We read it once (lru_cache) and index by cn8 prefix.
+Data source: Supabase ``taric_master_table``.
 
 Output (per branch):
   TaricBranch(
@@ -19,17 +18,14 @@ Output (per branch):
 """
 from __future__ import annotations
 
-import csv
 import functools
 import os
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from eu_export.app_config import LoadAppConfig
-
-csv.field_size_limit(sys.maxsize)
+from bussiness_logic.app_config import LoadAppConfig
+from agents.document_package import _connect_db, _release_db
 
 PROJECT_ROOT = Path(os.environ.get("ASAP_PROJECT_ROOT", Path(__file__).resolve().parents[3])).resolve()
 APP_CONFIG = LoadAppConfig(PROJECT_ROOT)
@@ -75,18 +71,22 @@ class TaricBranch:
         }
 
 
-@functools.lru_cache(maxsize=1)
-def _load_by_cn8(csv_path: str) -> dict[str, list[dict]]:
-    """{cn8 -> list of master_table row dicts}. Cached for process lifetime."""
-    if not Path(csv_path).exists():
-        raise FileNotFoundError(f"taric_master_table.csv not found: {csv_path}")
-    out: dict[str, list[dict]] = {}
-    with Path(csv_path).open(encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            cn8 = (r.get("cn8") or "").strip()
-            if cn8:
-                out.setdefault(cn8, []).append(r)
-    return out
+@functools.lru_cache(maxsize=512)
+def _load_rows_for_cn8(cn8: str) -> tuple[dict, ...]:
+    """Rows from Supabase taric_master_table for one CN8. Cached per process."""
+    conn = _connect_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM taric_master_table WHERE cn8 = %s", (cn8,))
+        cols = [d[0] for d in cur.description]
+        rows = [
+            {str(k): "" if v is None else str(v) for k, v in zip(cols, row)}
+            for row in cur.fetchall()
+        ]
+        cur.close()
+        return tuple(rows)
+    finally:
+        _release_db(conn)
 
 
 class TaricBranchResolverTool:
@@ -115,7 +115,7 @@ class TaricBranchResolverTool:
         cn8 = (cn8 or "").strip()
         if not cn8 or len(cn8) < 8:
             return []
-        rows = _load_by_cn8(str(self._master_csv)).get(cn8, [])
+        rows = list(_load_rows_for_cn8(cn8))
         if not rows:
             return []
 

@@ -22,8 +22,8 @@ from agents.classification_agent import ClassificationAgent
 from agents.document_agent import DocumentAgent
 from agents.evidence_intake_agent import EvidenceIntakeAgent
 from agents.orchestrator_agent import OrchestratorAgent
-from blackboard import BlackboardStore
-from eu_export.app_config import LoadAppConfig
+from agents.blackboard import BlackboardStore
+from bussiness_logic.app_config import LoadAppConfig
 
 
 APP_CONFIG = LoadAppConfig(PROJECT_ROOT)
@@ -64,7 +64,7 @@ def collect_kurly_url_facts(
     Evidence_Intake_Agent, so the Blackboard still starts from normalized
     product facts.
     """
-    from eu_export.product import (
+    from bussiness_logic.product import (
         KurlyGlobalPageParser,
         KurlyPageAdapter,
         KurlyPageCollector,
@@ -74,12 +74,12 @@ def collect_kurly_url_facts(
         PaddleOcrEngine,
         PaddleStructureOcrEngine,
     )
-    from eu_export.bridge import (
+    from bussiness_logic.bridge import (
         BuildLlmRuntimeConfigFromEnv,
         BuildRuntimeAdapter,
         RuntimeAdapterBuildError,
     )
-    from eu_export.input_process import (
+    from bussiness_logic.input_process import (
         ProductInputAdapter,
         ProductInputReconstructionService,
     )
@@ -213,14 +213,8 @@ def collect_kurly_url_facts(
         if str(warning).strip()
     )
     warnings = list(dict.fromkeys(warnings))
-    reconstructed_product_facts = (
+    classification_input_product_facts = (
         input_reconstruction.get("classification_input_product_facts") or []
-    )
-    llm_reconstructed_product_facts = (
-        input_reconstruction.get("llm_reconstructed_product_facts") or []
-    )
-    fallback_product_facts = (
-        input_reconstruction.get("fallback_product_facts") or []
     )
     unresolved_product_facts = (
         input_reconstruction.get("unresolved_product_facts") or []
@@ -228,7 +222,7 @@ def collect_kurly_url_facts(
     product_fact_conflicts = (
         input_reconstruction.get("product_fact_conflicts") or []
     )
-    classification_fact_texts = (
+    classification_input_text_lines = (
         input_reconstruction.get("classification_input_fact_texts") or []
     )
     facts = {
@@ -241,14 +235,10 @@ def collect_kurly_url_facts(
         "source_product_page": source_product_page,
         "ocr_text": [product_input.ocrText] if product_input.ocrText else [],
         "ingredient_list": list(product_input.normalizedOcrFactTexts or []),
-        "classification_input_product_facts": reconstructed_product_facts,
-        "structured_product_facts": reconstructed_product_facts,
-        "llm_reconstructed_product_facts": llm_reconstructed_product_facts,
-        "fallback_product_facts": fallback_product_facts,
+        "classification_input_product_facts": classification_input_product_facts,
         "unresolved_product_facts": unresolved_product_facts,
         "product_fact_conflicts": product_fact_conflicts,
-        "classification_input_fact_texts": classification_fact_texts,
-        "classification_fact_texts": classification_fact_texts,
+        "classification_input_fact_texts": classification_input_text_lines,
         "origin_country": "KR",
         "intended_use": "human consumption",
         "warnings": warnings,
@@ -272,7 +262,7 @@ def build_raw_input_from_ui(
     facts: dict[str, Any],
 ) -> dict[str, Any]:
     """Map Dash text + Product facts JSON into EvidenceIntakeAgent input."""
-    facts = _normalize_loose_product_facts(facts or {})
+    facts = _normalize_product_facts(facts or {})
     url = str(facts.get("url") or "").strip()
     if url and (
         "kurly.com/goods/" in url
@@ -285,7 +275,7 @@ def build_raw_input_from_ui(
             for key, value in collected.items():
                 if value not in ("", [], None):
                     merged[key] = value
-            facts = _normalize_loose_product_facts(merged)
+            facts = _normalize_product_facts(merged)
         except Exception as exc:  # noqa: BLE001
             facts.setdefault("warnings", [])
             facts["warnings"].append(f"kurly_url_intake_failed: {exc}")
@@ -298,21 +288,9 @@ def build_raw_input_from_ui(
     if isinstance(ocr_text, str):
         ocr_text = [ocr_text] if ocr_text.strip() else []
     input_reconstruction = facts.get("input_reconstruction") or {}
-    structured_product_facts = (
+    classification_input_product_facts = (
         facts.get("classification_input_product_facts")
-        or facts.get("structured_product_facts")
         or input_reconstruction.get("classification_input_product_facts")
-        or input_reconstruction.get("product_facts")
-        or []
-    )
-    llm_reconstructed_product_facts = (
-        facts.get("llm_reconstructed_product_facts")
-        or input_reconstruction.get("llm_reconstructed_product_facts")
-        or []
-    )
-    fallback_product_facts = (
-        facts.get("fallback_product_facts")
-        or input_reconstruction.get("fallback_product_facts")
         or []
     )
     unresolved_product_facts = (
@@ -327,34 +305,21 @@ def build_raw_input_from_ui(
         or input_reconstruction.get("conflicts")
         or []
     )
-    classification_fact_texts = (
+    classification_input_text_lines = (
         facts.get("classification_input_fact_texts")
         or input_reconstruction.get("classification_input_fact_texts")
-        or facts.get("classification_fact_texts")
-        or input_reconstruction.get("classification_fact_texts")
         or facts.get("ingredient_list")
         or []
     )
-    legacy_structured_product_facts = (
-        facts.get("structured_product_facts")
-        or input_reconstruction.get("product_facts")
-        or []
-    )
-    if not structured_product_facts:
-        structured_product_facts = legacy_structured_product_facts
 
     return {
         "product_name": facts.get("product_name") or query,
         "description": facts.get("description") or facts.get("short_description") or "",
-        "composition": facts.get("composition") or classification_fact_texts or [],
-        "classification_input_product_facts": structured_product_facts,
-        "structured_product_facts": structured_product_facts,
-        "llm_reconstructed_product_facts": llm_reconstructed_product_facts,
-        "fallback_product_facts": fallback_product_facts,
+        "composition": facts.get("composition") or classification_input_text_lines or [],
+        "classification_input_product_facts": classification_input_product_facts,
         "unresolved_product_facts": unresolved_product_facts,
         "product_fact_conflicts": product_fact_conflicts,
-        "classification_input_fact_texts": classification_fact_texts,
-        "classification_fact_texts": classification_fact_texts,
+        "classification_input_fact_texts": classification_input_text_lines,
         "ocr_text": ocr_text,
         "source_urls": source_urls,
         "origin_country": facts.get("origin_country") or "KR",
@@ -365,63 +330,11 @@ def build_raw_input_from_ui(
     }
 
 
-def _normalize_loose_product_facts(facts: dict[str, Any]) -> dict[str, Any]:
-    """Accept common user-pasted wrappers before normalizing product facts."""
+def _normalize_product_facts(facts: dict[str, Any]) -> dict[str, Any]:
+    """Normalize explicit Product facts payloads."""
     if not isinstance(facts, dict):
         return {}
-    facts = _unwrap_product_fact_wrapper(facts)
-
-    # Some UI flows pass a JSON-ish evidence object as the query/product_name
-    # string. Parse it here so Evidence_Intake_Agent sees real facts rather
-    # than a large JSON blob as the product name.
-    for key in ("raw_input_to_evidence_intake", "raw_input_to_evidence", "product_facts"):
-        value = facts.get(key)
-        if isinstance(value, dict):
-            merged = dict(facts)
-            merged.update(value)
-            facts = merged
-            break
-
-    for text_key in ("product_name", "description", "query", "text"):
-        parsed = _parse_embedded_product_fact_text(facts.get(text_key))
-        if parsed:
-            merged = dict(facts)
-            merged.update(parsed)
-            facts = merged
-            break
-
     return _normalize_kurly_result_facts(facts)
-
-
-def _unwrap_product_fact_wrapper(facts: dict[str, Any]) -> dict[str, Any]:
-    for key in ("raw_input_to_evidence_intake", "raw_input_to_evidence", "product_facts"):
-        value = facts.get(key)
-        if isinstance(value, dict):
-            return value
-    return facts
-
-
-def _parse_embedded_product_fact_text(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, str):
-        return None
-    text = value.strip().rstrip(",")
-    if not text:
-        return None
-
-    candidates = [text]
-    if text.startswith('"raw_input_to_evidence_intake"') or text.startswith('"raw_input_to_evidence"'):
-        candidates.append("{" + text + "}")
-    if text.startswith("raw_input_to_evidence_intake"):
-        candidates.append('{"' + text)
-
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return _unwrap_product_fact_wrapper(parsed)
-    return None
 
 
 def _normalize_kurly_result_facts(facts: dict[str, Any]) -> dict[str, Any]:
@@ -456,21 +369,9 @@ def _normalize_kurly_result_facts(facts: dict[str, Any]) -> dict[str, Any]:
         or normalization.get("fact_texts")
         or []
     )
-    structured_product_facts = (
+    classification_input_product_facts = (
         facts.get("classification_input_product_facts")
         or llm_reconstruction.get("classification_input_product_facts")
-        or facts.get("structured_product_facts")
-        or llm_reconstruction.get("product_facts")
-        or []
-    )
-    llm_reconstructed_product_facts = (
-        facts.get("llm_reconstructed_product_facts")
-        or llm_reconstruction.get("llm_reconstructed_product_facts")
-        or []
-    )
-    fallback_product_facts = (
-        facts.get("fallback_product_facts")
-        or llm_reconstruction.get("fallback_product_facts")
         or []
     )
     unresolved_product_facts = (
@@ -531,14 +432,10 @@ def _normalize_kurly_result_facts(facts: dict[str, Any]) -> dict[str, Any]:
         "sale_unit": product.get("sale_unit") or parsed.get("sale_unit") or facts.get("sale_unit") or "",
         "ocr_text": ocr_text or facts.get("ocr_text") or [],
         "ingredient_list": fact_texts or facts.get("ingredient_list") or [],
-        "classification_input_product_facts": structured_product_facts,
-        "structured_product_facts": structured_product_facts,
-        "llm_reconstructed_product_facts": llm_reconstructed_product_facts,
-        "fallback_product_facts": fallback_product_facts,
+        "classification_input_product_facts": classification_input_product_facts,
         "unresolved_product_facts": unresolved_product_facts,
         "product_fact_conflicts": product_fact_conflicts,
         "classification_input_fact_texts": fact_texts,
-        "classification_fact_texts": fact_texts,
     })
     return flattened
 

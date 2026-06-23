@@ -41,7 +41,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from blackboard import BlackboardStore, now_iso
+from agents.blackboard import BlackboardStore, now_iso
 
 
 @dataclass

@@ -12,7 +12,7 @@ Orchestrator:
 from __future__ import annotations
 
 from agents.agent_base import BaseAgent
-from blackboard import BlackboardStore, now_iso
+from agents.blackboard import BlackboardStore, now_iso
 
 
 class OrchestratorAgent(BaseAgent):
