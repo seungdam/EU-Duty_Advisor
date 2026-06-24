@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_COI_ROOT = PROJECT_ROOT / "test" / "COI(식품원재료풀이)"
 
 TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣]+")

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from agents import document_package as _db
 
@@ -105,6 +105,18 @@ _KEYWORD_TO_DOMAIN: list[tuple[re.Pattern, list[str]]] = [
 ]
 
 
+# Generic product-form anchors used only for chapter routing. These are not a
+# final CN rule; they give DomainRouter useful top-chapter hints when official
+# chapter keywords are English-only but evidence is Korean OCR text.
+_PRODUCT_FORM_TO_CHAPTER: list[tuple[re.Pattern, str, str]] = [
+    (re.compile(r"\b(noodle|ramen|pasta|macaroni|spaghetti)\b|라면|유탕면|국수|면류|파스타"), "19", "cereal/noodle preparation"),
+    (re.compile(r"\b(sauce|seasoning|condiment|soup|broth|stock)\b|소스|양념|조미|스프|국|탕|찌개|육수"), "21", "miscellaneous edible preparation"),
+    (re.compile(r"\b(dumpling|mandu|sausage|ham|surimi)\b|만두|소시지|햄|어묵|맛살|멘보샤"), "16", "meat/fish/crustacean preparation"),
+    (re.compile(r"\b(jam|pickle|fruit preparation|vegetable preparation)\b|잼|절임|피클|과실가공|채소가공"), "20", "vegetable/fruit preparation"),
+    (re.compile(r"\b(beverage|drink|juice|tea)\b|음료|주스|차음료"), "22", "beverage"),
+]
+
+
 @dataclass
 class DomainRouteResult:
     """One product → one or more applicable regulatory domains."""
@@ -171,6 +183,24 @@ class DomainRouterTool:
             return dict(zip(cols, row)) if row else {}
         except Exception:
             return {}
+        finally:
+            _db._release_db(conn)
+
+    def _fetch_all_chapter_rows(self) -> list[dict]:
+        conn = None
+        try:
+            conn = _db._connect_db()
+            cur = conn.cursor()
+            if not _db._table_exists(cur, "cn_chapter_index"):
+                cur.close()
+                return []
+            cur.execute("SELECT * FROM cn_chapter_index ORDER BY chapter")
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+            cur.close()
+            return rows
+        except Exception:
+            return []
         finally:
             _db._release_db(conn)
 
@@ -250,6 +280,198 @@ class DomainRouterTool:
             })
 
         return domains, pre_gate_domains, evidence
+
+    @staticmethod
+    def _term_matches(terms: list[str], haystack: str) -> list[str]:
+        out: list[str] = []
+        normalized = f" {re.sub(r'\\s+', ' ', haystack or '').lower()} "
+        for term in terms:
+            term_norm = re.sub(r"\s+", " ", str(term or "").strip().lower())
+            if len(term_norm) < 2:
+                continue
+            if term_norm in normalized and term not in out:
+                out.append(term)
+        return out
+
+    def route_product(
+        self,
+        *,
+        product_understanding: dict[str, Any],
+        product_facts: dict[str, Any] | None = None,
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        """Route product evidence to chapter/domain candidates before CN8.
+
+        This is a soft-routing read model for Classification_Agent. It does
+        not eliminate chapters; it provides top chapter candidates and
+        guardrail evidence, especially raw-vs-prepared food redirects.
+        """
+        product_facts = product_facts or {}
+        text_parts = [
+            product_understanding.get("classification_text") or "",
+            " ".join(product_understanding.get("keywords") or []),
+            " ".join(product_understanding.get("routing_terms") or []),
+            product_facts.get("product_name") or "",
+            product_facts.get("description") or "",
+        ]
+        haystack = "\n".join(str(p) for p in text_parts if p)
+        processing_state = product_understanding.get("processing_state") or "unknown"
+        processed = processing_state == "processed_or_prepared" or bool(
+            product_understanding.get("processing_signals")
+        )
+        domain_hints = set(product_understanding.get("domain_hints") or [])
+
+        rows = self._fetch_all_chapter_rows()
+        row_by_chapter = {str(r.get("chapter") or "").zfill(2): r for r in rows}
+        scores: dict[str, dict[str, Any]] = {}
+        blocked: list[dict[str, Any]] = []
+        redirect_bonus: dict[str, float] = {}
+
+        for row in rows:
+            chapter = str(row.get("chapter") or "").zfill(2)
+            if not chapter:
+                continue
+            keyword_terms = self._split_values(row.get("chapter_keywords") or "")
+            prepared_terms = self._split_values(row.get("prepared_scope_signals") or "")
+            raw_terms = self._split_values(row.get("raw_scope_signals") or "")
+            domain_terms = self._split_values(row.get("domain_scope_candidates") or "")
+
+            keyword_matches = self._term_matches(keyword_terms, haystack)
+            prepared_matches = self._term_matches(prepared_terms, haystack)
+            raw_matches = self._term_matches(raw_terms, haystack)
+            score = float(len(keyword_matches) * 4)
+            if processed:
+                score += len(prepared_matches) * 5
+                if raw_matches:
+                    score -= 2
+            else:
+                score += len(raw_matches) * 3
+
+            form_matches: list[str] = []
+            for pattern, target_chapter, reason in _PRODUCT_FORM_TO_CHAPTER:
+                m = pattern.search(haystack)
+                if m and target_chapter == chapter:
+                    score += 8.0
+                    form_matches.append(f"{m.group(0)}:{reason}")
+
+            redirects = self._split_values(row.get("prepared_food_redirect_chapters") or "")
+            if processed and raw_matches and redirects:
+                blocked.append({
+                    "chapter": chapter,
+                    "chapter_title": row.get("chapter_title") or "",
+                    "reason": "processed_product_guardrail_redirect",
+                    "matched_raw_terms": raw_matches,
+                    "redirect_chapters": redirects,
+                })
+                for redirect in redirects:
+                    redirect_chapter = re.sub(r"\D", "", redirect)[:2].zfill(2)
+                    if redirect_chapter:
+                        redirect_bonus[redirect_chapter] = redirect_bonus.get(redirect_chapter, 0.0) + 5.0
+
+            if score <= 0:
+                continue
+            scores[chapter] = {
+                "chapter": chapter,
+                "chapter_title": row.get("chapter_title") or "",
+                "score": score,
+                "matched_terms": keyword_matches + prepared_matches + raw_matches + form_matches,
+                "form_matches": form_matches,
+                "keyword_matches": keyword_matches,
+                "prepared_matches": prepared_matches,
+                "raw_matches": raw_matches,
+                "routing_summary": row.get("routing_summary") or "",
+                "routing_guardrails": row.get("routing_guardrails") or "",
+                "classification_decision_axes": self._split_values(
+                    row.get("classification_decision_axes") or ""
+                ),
+                "prepared_food_redirect_chapters": redirects,
+            }
+
+        for chapter, bonus in redirect_bonus.items():
+            row = row_by_chapter.get(chapter, {})
+            scores.setdefault(chapter, {
+                "chapter": chapter,
+                "chapter_title": row.get("chapter_title") or "",
+                "score": 0.0,
+                "matched_terms": [],
+                "keyword_matches": [],
+                "prepared_matches": [],
+                "raw_matches": [],
+                "routing_summary": row.get("routing_summary") or "",
+                "routing_guardrails": row.get("routing_guardrails") or "",
+                "classification_decision_axes": self._split_values(
+                    row.get("classification_decision_axes") or ""
+                ),
+                "prepared_food_redirect_chapters": [],
+            })
+            scores[chapter]["score"] += bonus
+            scores[chapter].setdefault("routing_adjustments", []).append({
+                "type": "prepared_food_redirect_bonus",
+                "bonus": bonus,
+            })
+
+        if not scores and "food" in domain_hints:
+            for chapter in ("16", "19", "20", "21", "22"):
+                row = row_by_chapter.get(chapter, {})
+                scores[chapter] = {
+                    "chapter": chapter,
+                    "chapter_title": row.get("chapter_title") or "",
+                    "score": 1.0,
+                    "matched_terms": ["food_domain_hint"],
+                    "keyword_matches": [],
+                    "prepared_matches": [],
+                    "raw_matches": [],
+                    "routing_summary": row.get("routing_summary") or "",
+                    "routing_guardrails": row.get("routing_guardrails") or "",
+                    "classification_decision_axes": self._split_values(
+                        row.get("classification_decision_axes") or ""
+                    ),
+                    "prepared_food_redirect_chapters": [],
+                }
+
+        ranked = sorted(scores.values(), key=lambda x: (-float(x.get("score") or 0), x.get("chapter") or ""))
+        max_score = float(ranked[0]["score"]) if ranked else 0.0
+        candidates: list[dict[str, Any]] = []
+        domain_scopes: list[str] = []
+        pre_gate_domains: list[str] = []
+        evidence: list[dict[str, Any]] = []
+        for item in ranked[: max(1, top_k)]:
+            chapter = item["chapter"]
+            row = row_by_chapter.get(chapter, {})
+            domains, pre_gates, route_evidence = self._domains_from_routes(chapter, row)
+            for d in domains:
+                if d not in domain_scopes:
+                    domain_scopes.append(d)
+            for d in pre_gates:
+                if d not in pre_gate_domains:
+                    pre_gate_domains.append(d)
+            evidence.extend(route_evidence)
+            item = dict(item)
+            item["confidence"] = round(min(0.95, max(0.2, item["score"] / (max_score + 1.0))), 3) if max_score else 0.2
+            item["domain_scopes"] = domains
+            item["pre_gate_domains"] = pre_gates
+            candidates.append(item)
+
+        return {
+            "candidate_chapters": candidates,
+            "blocked_chapters": blocked,
+            "domain_scopes": domain_scopes,
+            "pre_gate_domains": pre_gate_domains,
+            "processing_state": processing_state,
+            "soft_filter": True,
+            "routing_basis": {
+                "method": "cn_chapter_index_keyword_guardrail",
+                "table": "cn_chapter_index",
+                "top_k": top_k,
+                "processed_guardrail_applied": bool(blocked),
+            },
+            "missing_facts": [
+                "primary_ingredient_ratio"
+                for _ in [0]
+                if not re.search(r"\b\d{1,3}\s*%", haystack)
+            ],
+            "evidence": evidence,
+        }
 
     def route(
         self,

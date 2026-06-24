@@ -495,6 +495,248 @@ def _checklist_summary(requirements: list["Requirement"]) -> dict:
     }
 
 
+def _binding_source_layer(detail: "DetailedRequirement") -> str:
+    if detail.source_layer == "baseline_document":
+        return "baseline"
+    if detail.source_layer == "pre_taric_gate":
+        return "pre_taric"
+    return "post_taric"
+
+
+def _normalize_binding_level(value: str) -> str:
+    level = str(value or "").strip().lower()
+    if level in {"required", "mandatory", "mandatory_check"}:
+        return "required"
+    if level in {"conditional", "condition"}:
+        return "conditional"
+    if level in {"support", "supporting"}:
+        return "support"
+    if level in {"optional", "exempted"}:
+        return "optional"
+    if level in {"pending", "needs_review"}:
+        return "pending"
+    return "conditional"
+
+
+def _merge_binding_level(current: str, incoming: str) -> str:
+    rank = {"required": 0, "conditional": 1, "pending": 2, "support": 3, "optional": 4}
+    current = _normalize_binding_level(current)
+    incoming = _normalize_binding_level(incoming)
+    return current if rank.get(current, 9) <= rank.get(incoming, 9) else incoming
+
+
+def _binding_field_status(missing_facts: list[str], required_level: str) -> str:
+    if missing_facts:
+        return "pending" if _normalize_binding_level(required_level) == "required" else "conditional"
+    return "satisfied"
+
+
+def _fetch_document_binding_cards(
+    cur,
+    requirements: list["Requirement"],
+    product_facts: dict,
+) -> list[dict]:
+    """Group applicable baseline/pre/post rows into UI document cards.
+
+    document_binding is intentionally compact, so human-readable document names
+    are resolved from baseline_document_master and source provenance stays on
+    each binding row.
+    """
+    if not _table_exists(cur, "document_binding"):
+        return []
+    if not (
+        _table_exists(cur, "baseline_document_master")
+        and _column_exists(cur, "baseline_document_master", "document_id")
+    ):
+        return []
+
+    source_ids: dict[str, set[str]] = defaultdict(set)
+    details_by_ref: dict[tuple[str, str], list[DetailedRequirement]] = defaultdict(list)
+    for req in requirements:
+        if not req.applies_to_korea:
+            continue
+        for detail in req.detailed_requirements:
+            source_id = detail.requirement_master_id
+            if not source_id:
+                continue
+            source_layer = _binding_source_layer(detail)
+            source_ids[source_layer].add(source_id)
+            details_by_ref[(source_layer, source_id)].append(detail)
+
+    clauses: list[str] = []
+    params: list[object] = []
+    for source_layer in ("baseline", "pre_taric", "post_taric"):
+        ids = sorted(source_ids.get(source_layer) or [])
+        if not ids:
+            continue
+        clauses.append("(source_layer = %s AND source_id = ANY(%s))")
+        params.extend([source_layer, ids])
+    if not clauses:
+        return []
+
+    cur.execute(
+        f"""
+        SELECT binding_id, document_id, source_layer, source_id, binding_action,
+               required_level, field_key, required_fact_key, sort_order
+        FROM document_binding
+        WHERE {" OR ".join(clauses)}
+        ORDER BY
+          CASE
+            WHEN sort_order::text ~ '^[0-9]+$' THEN sort_order::int
+            ELSE 999999
+          END,
+          document_id,
+          binding_id
+        """,
+        params,
+    )
+    cols = [d[0] for d in cur.description]
+    binding_rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    if not binding_rows:
+        return []
+
+    document_ids = sorted({
+        str(row.get("document_id") or "").strip()
+        for row in binding_rows
+        if str(row.get("document_id") or "").strip()
+    })
+    if not document_ids:
+        return []
+
+    cur.execute(
+        """
+        SELECT *
+        FROM baseline_document_master
+        WHERE document_id = ANY(%s)
+        """,
+        (document_ids,),
+    )
+    baseline_cols = [d[0] for d in cur.description]
+    baseline_rows = [dict(zip(baseline_cols, row)) for row in cur.fetchall()]
+    baseline_by_id = {
+        str(row.get("document_id") or "").strip(): row
+        for row in baseline_rows
+        if str(row.get("document_id") or "").strip()
+    }
+
+    cards: dict[str, dict] = {}
+    field_maps: dict[str, dict[str, dict]] = defaultdict(dict)
+    for row in binding_rows:
+        document_id = str(row.get("document_id") or "").strip()
+        if not document_id:
+            continue
+        baseline = baseline_by_id.get(document_id) or {}
+        card = cards.setdefault(document_id, {
+            "document_id": document_id,
+            "document_code": baseline.get("document_code") or document_id.upper(),
+            "document_name": baseline.get("document_name") or document_id.replace("_", " ").title(),
+            "document_name_ko": baseline.get("document_name_ko") or baseline.get("document_name") or document_id,
+            "document_family": baseline.get("document_family") or "",
+            "required_level": "optional",
+            "decision_status": "optional",
+            "prepared_by": baseline.get("prepared_by") or "",
+            "submitted_to": baseline.get("submitted_to") or "",
+            "fields": [],
+            "pre_checks": [],
+            "post_requirements": [],
+            "pre_taric_links": [],
+            "post_taric_links": [],
+            "taric_certificates": [],
+            "missing_facts": [],
+            "source_bindings": [],
+        })
+
+        source_layer = str(row.get("source_layer") or "")
+        source_id = str(row.get("source_id") or "")
+        binding_level = _normalize_binding_level(str(row.get("required_level") or ""))
+        card["required_level"] = _merge_binding_level(card.get("required_level") or "optional", binding_level)
+
+        required_fact = str(row.get("required_fact_key") or "").strip()
+        binding_missing = [required_fact] if required_fact and not _fact_is_known(product_facts, required_fact) else []
+        for fact in binding_missing:
+            if fact not in card["missing_facts"]:
+                card["missing_facts"].append(fact)
+
+        source_binding = {
+            "binding_id": row.get("binding_id") or "",
+            "source_layer": source_layer,
+            "source_id": source_id,
+            "binding_action": row.get("binding_action") or "",
+            "required_level": binding_level,
+            "field_key": row.get("field_key") or "",
+            "required_fact_key": required_fact,
+            "missing_facts": binding_missing,
+        }
+        card["source_bindings"].append(source_binding)
+
+        field_key = str(row.get("field_key") or "").strip()
+        if (row.get("binding_action") or "") == "add_field" and field_key:
+            field = field_maps[document_id].setdefault(field_key, {
+                "field_key": field_key,
+                "label": field_key.replace("_", " "),
+                "required_by": [],
+                "missing_facts": [],
+                "status": "satisfied",
+            })
+            if source_layer not in field["required_by"]:
+                field["required_by"].append(source_layer)
+            for fact in binding_missing:
+                if fact not in field["missing_facts"]:
+                    field["missing_facts"].append(fact)
+            field["status"] = _binding_field_status(field["missing_facts"], card["required_level"])
+
+        source_details = details_by_ref.get((source_layer, source_id)) or []
+        for detail in source_details:
+            for fact in detail.missing_facts or []:
+                if fact not in card["missing_facts"]:
+                    card["missing_facts"].append(fact)
+            if detail.trigger_certificate_code and detail.trigger_certificate_code not in card["taric_certificates"]:
+                card["taric_certificates"].append(detail.trigger_certificate_code)
+            item = {
+                "source_id": source_id,
+                "requirement_type": detail.requirement_type,
+                "required_action": detail.required_action,
+                "required_level": detail.required_level,
+                "decision_status": detail.decision_status,
+                "missing_facts": list(detail.missing_facts or []),
+                "required_document": detail.required_document,
+                "domain": detail.domain_route or detail.domain,
+            }
+            if source_layer == "pre_taric":
+                card["pre_checks"].append(item)
+                if source_id not in card["pre_taric_links"]:
+                    card["pre_taric_links"].append(source_id)
+            elif source_layer == "post_taric":
+                card["post_requirements"].append(item)
+                if source_id not in card["post_taric_links"]:
+                    card["post_taric_links"].append(source_id)
+
+        card["decision_status"] = card["required_level"]
+
+    def sort_key(card: dict) -> tuple[int, str]:
+        raw = baseline_by_id.get(card.get("document_id") or "", {}).get("runtime_sort_order") or ""
+        try:
+            order = int(str(raw))
+        except ValueError:
+            order = 9999
+        return order, str(card.get("document_id") or "")
+
+    for document_id, card in cards.items():
+        fields = list(field_maps.get(document_id, {}).values())
+        fields.sort(key=lambda f: f.get("field_key") or "")
+        card["fields"] = fields
+        card["pre_checks"] = list({x["source_id"]: x for x in card["pre_checks"]}.values())
+        card["post_requirements"] = list({x["source_id"]: x for x in card["post_requirements"]}.values())
+        card["taric_certificates"] = sorted(card["taric_certificates"])
+        card["missing_facts"] = sorted(card["missing_facts"])
+        card["source_bindings"] = sorted(
+            card["source_bindings"],
+            key=lambda b: (b.get("source_layer") or "", b.get("source_id") or "", b.get("binding_id") or ""),
+        )
+
+    return sorted(cards.values(), key=sort_key)
+
+
 def _merge_status(current: str, incoming: str) -> str:
     rank = {"required": 0, "conditional": 1, "pending": 2, "exempted": 3}
     return current if rank.get(current, 9) <= rank.get(incoming, 9) else incoming
@@ -1544,18 +1786,23 @@ def get_document_package(
             + ", ".join(domain_names)
         )
 
-    cur.close()
-    _release_db(conn)
-
     # KR 적용 measure 먼저 정렬
     requirements.sort(key=lambda r: (not r.applies_to_korea, r.measure_type))
+    checklist_summary = _checklist_summary(requirements)
+    binding_cards = _fetch_document_binding_cards(cur, requirements, product_facts)
+    if binding_cards:
+        checklist_summary["document_binding_cards"] = binding_cards
+        checklist_summary["document_binding_count"] = len(binding_cards)
+
+    cur.close()
+    _release_db(conn)
 
     return DocumentPackage(
         taric10=code, cn8=cn8, total_measure_rows=len(rows),
         has_data=bool(rows or requirements), requirements=requirements,
         verification_urls=_verification_urls(code), data_source=DB_SOURCE_NAME,
         notes=notes, product_facts=product_facts,
-        checklist_summary=_checklist_summary(requirements),
+        checklist_summary=checklist_summary,
     )
 
 

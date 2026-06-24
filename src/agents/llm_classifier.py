@@ -55,6 +55,52 @@ LAST_CLASSIFY_TRACE: dict[str, Any] = {}
 
 TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣]+")
 JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```|(\{.*\})", re.DOTALL)
+ALLERGEN_TOKENS = (
+    "우유",
+    "대두",
+    "밀",
+    "계란",
+    "난류",
+    "메밀",
+    "땅콩",
+    "호두",
+    "잣",
+    "돼지고기",
+    "닭고기",
+    "쇠고기",
+    "고등어",
+    "게",
+    "새우",
+    "오징어",
+    "조개류",
+    "복숭아",
+    "토마토",
+    "아황산류",
+    "soy",
+    "milk",
+    "wheat",
+    "egg",
+    "peanut",
+    "walnut",
+    "pork",
+    "chicken",
+    "beef",
+    "mackerel",
+    "crab",
+    "shrimp",
+    "squid",
+    "shellfish",
+)
+ALLERGEN_LINE_RE = re.compile(
+    r"알레르|알러지|allergen|allergy|may contain|trace allergen|"
+    r"같은\s*제조시설|동일\s*제조시설|교차\s*오염|혼입",
+    re.I,
+)
+ALLERGEN_TAIL_RE = re.compile(
+    r"(?:(?:알레르기\s*유발물질|알레르겐|알러지\s*유발물질|allergen|allergy)\s*[:：].*|"
+    r"(?:may contain|trace allergen|같은\s*제조시설|동일\s*제조시설|교차\s*오염|혼입).*)$",
+    re.I,
+)
 KO_QUERY_HINTS: tuple[tuple[str, str], ...] = (
     ("미역국", "seaweed soup broth prepared soup"),
     ("재첩국", "corbicula clam soup broth prepared soup"),
@@ -100,6 +146,89 @@ def _tokenize(text: str) -> set[str]:
         for token in TOKEN_RE.findall(text or "")
         if len(token) >= 2
     }
+
+
+def _allergen_token_count(text: str) -> int:
+    lower = (text or "").lower()
+    return sum(1 for token in ALLERGEN_TOKENS if token.lower() in lower)
+
+
+def _is_standalone_allergen_statement(line: str) -> bool:
+    text = line.strip()
+    if not text:
+        return False
+    lower = text.lower()
+    table_like = "|" in text or "\t" in text
+    classification_markers = (
+        "원재료",
+        "원료",
+        "성분",
+        "함량",
+        "품명",
+        "제품명",
+        "식품유형",
+        "ingredient",
+        "composition",
+        "mackerel",
+        "octopus",
+        "squid",
+        "shrimp",
+        "noodle",
+        "soup",
+    )
+    if table_like and any(marker in lower for marker in classification_markers):
+        return False
+    if ALLERGEN_LINE_RE.search(text):
+        return True
+    protected_source_line = any(
+        marker in text
+        for marker in (
+            "원재료명",
+            "원료명",
+            "ingredients",
+            "ingredient",
+            "성분",
+            "함량",
+            "제품명",
+            "식품유형",
+        )
+    )
+    return (
+        "함유" in text
+        and not protected_source_line
+        and _allergen_token_count(text) >= 2
+        and len(text) <= 180
+    )
+
+
+def _sanitize_classification_input(text: str) -> tuple[str, list[str]]:
+    """Remove allergen/trace statements from classification evidence.
+
+    Allergen declarations are safety/label facts, not principal ingredient
+    facts.  Keeping them in the CN classifier input causes false chapter
+    routing toward dairy/meat/fish raw-material chapters.
+    """
+
+    removed: list[str] = []
+    kept: list[str] = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            kept.append(raw_line)
+            continue
+        stripped_tail = ALLERGEN_TAIL_RE.sub("", line).strip()
+        if stripped_tail != line:
+            removed.append(line)
+            if stripped_tail:
+                kept.append(stripped_tail)
+            continue
+        if _is_standalone_allergen_statement(line):
+            removed.append(line)
+            continue
+        kept.append(line)
+    sanitized = "\n".join(kept)
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized).strip()
+    return sanitized, removed
 
 
 def _expand_query(text: str) -> str:
@@ -481,11 +610,38 @@ def classify(product_input: str, top_k: int = 5, chapter_hint: str | None = None
     print(f"[분류 시작] {product_input[:120]!r}")
     print(f"  cn_table 검색 source={CN_TABLE_NAME} model={LLM_MODEL}", flush=True)
 
-    candidates = search_cn_candidates(product_input, top_k=max(LLM_CANDIDATE_COUNT, top_k))
+    sanitized_input, removed_allergen_fragments = _sanitize_classification_input(product_input)
+    if removed_allergen_fragments:
+        print(
+            f"  allergen/cross-contact fragments removed={len(removed_allergen_fragments)}",
+            flush=True,
+        )
+
+    candidates = search_cn_candidates(sanitized_input, top_k=max(LLM_CANDIDATE_COUNT, top_k))
     if not candidates:
+        LAST_CLASSIFY_TRACE.clear()
+        LAST_CLASSIFY_TRACE.update(
+            {
+                "model": LLM_MODEL,
+                "ollama_endpoint": OLLAMA_ENDPOINT,
+                "raw_input": product_input[:12000],
+                "sanitized_input": sanitized_input[:12000],
+                "removed_allergen_fragments": removed_allergen_fragments[:80],
+                "removed_allergen_count": len(removed_allergen_fragments),
+                "candidate_payload": [],
+                "output_hs6": [],
+                "output_cn8": [],
+                "parse_ok": False,
+                "fallback_used": False,
+            }
+        )
         return []
 
-    decision, trace = _llm_select_with_trace(product_input, candidates)
+    decision, trace = _llm_select_with_trace(sanitized_input, candidates)
+    trace["raw_input"] = product_input[:12000]
+    trace["sanitized_input"] = sanitized_input[:12000]
+    trace["removed_allergen_fragments"] = removed_allergen_fragments[:80]
+    trace["removed_allergen_count"] = len(removed_allergen_fragments)
     ranked = decision.get("ranked") if isinstance(decision, dict) else None
     output: list[dict[str, Any]] = []
     candidate_by_code = {row["cn8"]: row for row in candidates}

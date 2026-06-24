@@ -100,6 +100,68 @@ def _first_text(*values: Any) -> str:
     return ""
 
 
+def _enrich_baseline_doc(detail: dict[str, Any]) -> dict[str, Any]:
+    """Map DetailedRequirement dict → UI-friendly baseline_document.
+
+    render_document_checklist expects these flat keys:
+      document_name_ko / document_name / document_code
+      prepared_by / submitted_to
+      taric_certificates / pre_checks / post_requirements
+      fields  (list of {field_key, label, required_by, missing_facts, status})
+      decision_status / required_level / missing_facts
+    """
+    cond = detail.get("condition_text") or ""
+    parsed: dict[str, str] = {}
+    for part in cond.split("|"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        parsed[k.strip()] = v.strip()
+
+    def _split(value: str) -> list[str]:
+        if not value:
+            return []
+        return [item.strip() for item in value.split(";") if item.strip()]
+
+    document_name = detail.get("required_document") or detail.get("requirement_master_id") or "Baseline document"
+    document_code = parsed.get("document_code") or detail.get("requirement_master_id") or ""
+
+    field_keys = detail.get("user_fallback_evidence") or []
+    missing_set = set(detail.get("missing_facts") or [])
+    fields = [
+        {
+            "field_key": key,
+            "label": key.replace("_", " "),
+            "required_by": ["baseline"],
+            "missing_facts": [key] if key in missing_set else [],
+            "status": "conditional" if key in missing_set else "satisfied",
+        }
+        for key in field_keys[:12]
+    ]
+
+    enriched = dict(detail)
+    enriched.update({
+        "document_code": document_code,
+        "document_name": document_name,
+        "document_name_ko": document_name,
+        "prepared_by": parsed.get("prepared_by", ""),
+        "submitted_to": parsed.get("submitted_to", ""),
+        "taric_certificates": (
+            _split(parsed.get("linked_certificates", ""))
+            or list(detail.get("external_dataset_ids") or [])
+        ),
+        "pre_checks": [
+            {"requirement_type": t} for t in _split(parsed.get("linked_pre", ""))
+        ],
+        "post_requirements": [
+            {"requirement_type": t} for t in _split(parsed.get("linked_post", ""))
+        ],
+        "fields": fields,
+    })
+    return enriched
+
+
 def _view_is_control_measure(req: dict[str, Any]) -> bool:
     mt = req.get("measure_type") or ""
     return any(
@@ -161,14 +223,24 @@ def _declaration_label(cert: dict[str, Any]) -> str:
 
 
 def _related_declarations_by_domain(product_reqs: list[dict[str, Any]], kr_reqs: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Group Y-code exemption declarations by domain for the UI declaration panel.
+
+    The UI looks declarations up by each rendered detail's own domain
+    (``related_declarations.get(detail.domain_route)``). A measure-level
+    declaration (e.g. a Veterinary-control Y-code on fishery/animal_origin_food)
+    must therefore be surfaced under its OWN domain — not only under the routed
+    product domain — otherwise a coarse route like ``food`` drops every
+    declaration and the panel goes empty. We surface each declaration under its
+    own domain AND under any routed product domain it aliases to. Exemption
+    declarations are waivers the importer self-declares, so over-surfacing is
+    safer than silently dropping them.
+    """
     product_domains = {
         d.get("domain_route") or d.get("domain") or ""
         for req in product_reqs
         for d in (req.get("detailed_requirements") or [])
     }
     product_domains = {d for d in product_domains if d}
-    if not product_domains:
-        return {}
 
     cert_by_code = {
         (cert.get("code") or "").upper(): cert
@@ -176,8 +248,18 @@ def _related_declarations_by_domain(product_reqs: list[dict[str, Any]], kr_reqs:
         for cert in (req.get("certificates") or [])
         if cert.get("code")
     }
-    out: dict[str, list[str]] = {domain: [] for domain in product_domains}
+    out: dict[str, list[str]] = {}
     seen: set[tuple[str, str]] = set()
+
+    def _add(domain_key: str, label: str) -> None:
+        if not domain_key:
+            return
+        key = (domain_key, label)
+        if key in seen:
+            return
+        seen.add(key)
+        out.setdefault(domain_key, []).append(label)
+
     for req in kr_reqs:
         if req.get("measure_type") == "Product regulatory requirements":
             continue
@@ -195,14 +277,12 @@ def _related_declarations_by_domain(product_reqs: list[dict[str, Any]], kr_reqs:
             if not is_declaration:
                 continue
             label = _declaration_label(cert)
+            # Always surface under the declaration's own domain (UI lookup key),
+            # plus any routed product domain it aliases to.
+            _add(detail_domain or "general", label)
             for product_domain in product_domains:
-                if detail_domain not in _domain_aliases(product_domain):
-                    continue
-                key = (product_domain, label)
-                if key in seen:
-                    continue
-                seen.add(key)
-                out[product_domain].append(label)
+                if detail_domain in _domain_aliases(product_domain):
+                    _add(product_domain, label)
     return out
 
 
@@ -232,6 +312,9 @@ class DocumentAgent(BaseAgent):
         self.read_input(latest["candidate_set_id"])
 
         product_facts = pes.get("observed_facts") or {}
+        routing_context = bb.get("routing_context") or {}
+        if routing_context.get("routing_context_id"):
+            self.read_input(routing_context["routing_context_id"])
 
         for cand in latest["candidates"]:
             self.read_input(cand["candidate_id"])
@@ -247,18 +330,39 @@ class DocumentAgent(BaseAgent):
                 taric10 = target["taric10"]
                 cand_for_target = {**cand, "taric10": taric10}
 
-                # 0. Regulatory domain route from CN/chapter first. The result is
-                # passed into DocumentPackageTool so Supabase pre-TARIC gates can
-                # be queried before post-TARIC measure details are rendered.
-                pre_dom = self._domain_tool.route(
-                    cn8=cn8, product_facts=product_facts, measure_type_hints=[],
-                )
-                product_facts_for_doc = {
-                    **product_facts,
-                    "regulatory_domains": list(pre_dom.domains),
-                    "pre_gate_domains": list(getattr(pre_dom, "pre_gate_domains", []) or []),
-                    "chapter": getattr(pre_dom, "chapter", "") or cn8[:2],
-                }
+                # 0. Prefer pre-classification RoutingContext for baseline /
+                # pre-TARIC scope. Keep chapter tied to the candidate CN8 so a
+                # candidate document package remains candidate-specific.
+                route_domains = list(routing_context.get("domain_scopes") or [])
+                route_pre_gates = list(routing_context.get("pre_gate_domains") or [])
+                if route_domains or route_pre_gates:
+                    product_facts_for_doc = {
+                        **product_facts,
+                        "cn8": cn8,
+                        "taric10": taric10,
+                        "regulatory_domains": route_domains,
+                        "domain_scopes": route_domains,
+                        "pre_gate_domains": route_pre_gates,
+                        "chapter": cn8[:2],
+                        "routing_context": routing_context,
+                    }
+                    self.reason(
+                        f"Using RoutingContext for candidate {cand.get('candidate_id')}: "
+                        f"chapter={cn8[:2]} domains={route_domains} pre_gate={route_pre_gates}."
+                    )
+                else:
+                    pre_dom = self._domain_tool.route(
+                        cn8=cn8, product_facts=product_facts, measure_type_hints=[],
+                    )
+                    product_facts_for_doc = {
+                        **product_facts,
+                        "cn8": cn8,
+                        "taric10": taric10,
+                        "regulatory_domains": list(pre_dom.domains),
+                        "domain_scopes": list(pre_dom.domains),
+                        "pre_gate_domains": list(getattr(pre_dom, "pre_gate_domains", []) or []),
+                        "chapter": getattr(pre_dom, "chapter", "") or cn8[:2],
+                    }
 
                 # 1. Raw TARIC measure package
                 try:
@@ -473,6 +577,7 @@ class DocumentAgent(BaseAgent):
         preferential_measures = [r for r in view_duties if _view_is_preferential_measure(r)]
 
         checklist = raw.get("checklist_summary") or {}
+        binding_documents = checklist.get("document_binding_cards") or []
         document_groups = checklist.get("document_groups") or []
         missing = raw.get("missing_facts") or checklist.get("missing_facts") or []
 
@@ -492,11 +597,12 @@ class DocumentAgent(BaseAgent):
                 "preferential_count": len(preferential_measures),
                 "document_group_count": len(document_groups),
                 "required_document_count": len(required_documents),
-                "baseline_document_count": len(baseline_details),
+                "baseline_document_count": len(binding_documents) or len(baseline_details),
                 "product_rule_count": len(product_details),
                 "product_pre_count": len(pre_details),
                 "product_post_count": len(post_details),
                 "missing_count": len(missing),
+                "document_binding_count": len(binding_documents),
             },
             "sections": {
                 "overview": {
@@ -526,7 +632,8 @@ class DocumentAgent(BaseAgent):
                 },
                 "baseline_documents": {
                     "requirements": baseline_reqs,
-                    "documents": baseline_details,
+                    "documents": binding_documents or [_enrich_baseline_doc(d) for d in baseline_details],
+                    "source": "document_binding" if binding_documents else "baseline_document_master",
                 },
                 "product_regulations": {
                     "agent_bucket": product_regulations,

@@ -684,8 +684,177 @@ SEMANTIC_CANDIDATE_INDEX: CnSemanticCandidateIndex | None = None
 SEMANTIC_CANDIDATE_INDEX_STATUS: dict[str, Any] | None = None
 
 
+# ---------------------------------------------------------------------------
+# WCO 9-group classification routing — CN candidate buckets.
+# ---------------------------------------------------------------------------
+# The classifier retrieves candidates from WCO-Section-style chapter groups that
+# partition all of chapters 01-97 (full coverage, no silent fallback), PLUS two
+# narrow demo sub-buckets (prepared food 16-21, cosmetics 32-33) kept for the
+# capstone demo's precision. Routing is deterministic: a candidate chapter maps
+# to its demo sub-bucket if applicable, else to its WCO group. This avoids the
+# keyword-based mis-routing that put e.g. furniture (ch94) into a cosmetics
+# bucket. Regulatory domain scopes (food/cosmetics/animal_origin/... from
+# domain_scope_routes) remain the DocumentAgent vocabulary; they are not used as
+# classifier buckets here.
+def _chapter_range(lo: int, hi: int) -> frozenset[str]:
+    return frozenset(f"{c:02d}" for c in range(lo, hi + 1))
+
+
+# 9 WCO-Section groups — a complete partition of chapters 01-97.
+WCO_GROUP_CHAPTERS: dict[str, frozenset[str]] = {
+    "wco1_raw_materials": _chapter_range(1, 15),      # animal/vegetable raw
+    "wco2_prepared_food": _chapter_range(16, 24),     # prepared food/beverages
+    "wco3_chemicals": _chapter_range(25, 38),         # mineral/chemical
+    "wco4_plastics_leather": _chapter_range(39, 43),  # rubber/plastic/leather
+    "wco5_textiles_wood": _chapter_range(44, 67),     # wood/paper/textile
+    "wco6_stone_metal": _chapter_range(68, 83),       # stone/glass/metal
+    "wco7_machinery": _chapter_range(84, 85),         # machinery/electrical
+    "wco8_transport": _chapter_range(86, 92),         # transport/precision
+    "wco9_misc_finished": _chapter_range(93, 97),     # arms/finished/other
+}
+
+# Narrow demo sub-buckets layered over WCO groups for the capstone demo. A
+# chapter in one of these ranges routes here (precision) instead of the broader
+# WCO group it also belongs to (16-21 ⊂ wco2, 32-33 ⊂ wco3).
+DEMO_BUCKET_CHAPTERS: dict[str, frozenset[str]] = {
+    "food_16_21": _chapter_range(16, 21),
+    "cosmetics": frozenset({"32", "33"}),
+}
+
+# Pre-gate / screening scopes are document concerns (sanctions = ALL chapters,
+# cites = species screening), never CN candidate buckets. Kept for the
+# domain_scope_routes loader used elsewhere.
+_PRE_GATE_SCOPES = frozenset({"sanctions", "cites"})
+
+# Deterministic chapter -> demo sub-bucket precedence (checked before WCO group).
+_CHAPTER_TO_DEMO_BUCKET: dict[str, str] = {
+    ch: bucket
+    for bucket, chapters in DEMO_BUCKET_CHAPTERS.items()
+    for ch in chapters
+}
+
+_DOMAIN_SCOPE_ROUTE_CHAPTERS: dict[str, frozenset[str]] | None = None
+_CLASSIFIER_BUCKET_CHAPTERS: dict[str, frozenset[str]] | None = None
+
+
+def load_domain_scope_route_chapters() -> dict[str, frozenset[str]]:
+    """scope -> {zero-padded chapter} from domain_scope_routes (Supabase, cached).
+
+    Regulatory-domain vocabulary used by the DocumentAgent side; skips universal
+    "ALL" rows and pre-gate screening scopes. Not used for classifier buckets.
+    """
+    global _DOMAIN_SCOPE_ROUTE_CHAPTERS
+    if _DOMAIN_SCOPE_ROUTE_CHAPTERS is not None:
+        return _DOMAIN_SCOPE_ROUTE_CHAPTERS
+    out: dict[str, frozenset[str]] = {}
+    if _connect_db is None or _release_db is None:
+        _DOMAIN_SCOPE_ROUTE_CHAPTERS = out
+        return out
+    conn = _connect_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT domain_scope, chapters FROM domain_scope_routes")
+        fetched = cur.fetchall()
+        cur.close()
+    finally:
+        _release_db(conn)
+    for scope_raw, chapters_raw in fetched:
+        scope = str(scope_raw or "").strip().lower()
+        chapters_text = str(chapters_raw or "").strip()
+        if not scope or not chapters_text:
+            continue
+        if scope in _PRE_GATE_SCOPES or chapters_text.upper() == "ALL":
+            continue
+        chapters = frozenset(
+            part.strip().zfill(2)
+            for part in chapters_text.replace(",", ";").split(";")
+            if part.strip()
+        )
+        if chapters:
+            out[scope] = chapters
+    _DOMAIN_SCOPE_ROUTE_CHAPTERS = out
+    return out
+
+
+def classifier_bucket_chapters() -> dict[str, frozenset[str]]:
+    """Effective bucket_key -> chapters for CN candidate retrieval (cached).
+
+    = 9 WCO groups (full 01-97 coverage) + 2 narrow demo sub-buckets.
+    """
+    global _CLASSIFIER_BUCKET_CHAPTERS
+    if _CLASSIFIER_BUCKET_CHAPTERS is not None:
+        return _CLASSIFIER_BUCKET_CHAPTERS
+    _CLASSIFIER_BUCKET_CHAPTERS = {**WCO_GROUP_CHAPTERS, **DEMO_BUCKET_CHAPTERS}
+    return _CLASSIFIER_BUCKET_CHAPTERS
+
+
+def known_classifier_scopes() -> set[str]:
+    """Bucket keys the CN retriever can build candidates for."""
+    return set(classifier_bucket_chapters().keys())
+
+
+def bucket_for_chapter(chapter: str) -> str | None:
+    """Deterministic chapter -> bucket key (demo sub-bucket wins, else WCO group)."""
+    ch = str(chapter or "").strip().zfill(2)
+    if not ch or ch == "00":
+        return None
+    if ch in _CHAPTER_TO_DEMO_BUCKET:
+        return _CHAPTER_TO_DEMO_BUCKET[ch]
+    for group_key, chapters in WCO_GROUP_CHAPTERS.items():
+        if ch in chapters:
+            return group_key
+    return None
+
+
+def buckets_for_chapters(chapters) -> list[str]:
+    """Map DomainRouter candidate chapters to classifier bucket keys (ordered)."""
+    out: list[str] = []
+    for ch in chapters or []:
+        bucket = bucket_for_chapter(ch)
+        if bucket and bucket not in out:
+            out.append(bucket)
+    return out
+
+
+def normalize_router_scope(router_scope: str) -> str | None:
+    """Legacy: map a regulatory domain_scope name to a demo bucket key, or None.
+
+    Kept as a fallback for callers/routes that still pass regulatory scope names
+    instead of chapters. Only the demo scopes resolve; broader regulatory names
+    have no 1:1 classifier bucket under the WCO scheme.
+    """
+    key = str(router_scope or "").strip().lower()
+    if key in DEMO_BUCKET_CHAPTERS:
+        return key
+    if key == "food":
+        return "food_16_21"
+    return None
+
+
+def classifier_fallback_scopes() -> list[str]:
+    """Demo buckets to fall back on when routing yields no usable chapter."""
+    return [s for s in DEMO_BUCKET_CHAPTERS]
+
+
 class SupabaseCnCandidateRetriever(CnCandidateRetriever):
-    """CnCandidateRetriever backed by Supabase cn_table, not local CSV files."""
+    """CnCandidateRetriever backed by Supabase cn_table, not local CSV files.
+
+    Buckets are built only for the requested domain scopes (lazy, per-request),
+    so enabling the 9 semantic groups never loads the whole tariff — each run
+    queries cn_table for just the chapters of its active scopes.
+    """
+
+    def __init__(
+        self,
+        ontologyRootPath,
+        projectRootPath=None,
+        *,
+        requestedScopes: Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(ontologyRootPath, projectRootPath)
+        self._requestedScopes = [
+            str(s).strip() for s in (requestedScopes or []) if str(s).strip()
+        ]
 
     def _LoadRowsByDomainScope(self) -> dict[str, list[dict[str, str]]]:
         if self._rowsByDomainScope is not None:
@@ -693,27 +862,39 @@ class SupabaseCnCandidateRetriever(CnCandidateRetriever):
         if _connect_db is None or _release_db is None:
             raise RuntimeError("Supabase DB connector is not available.")
 
+        bucket_chapters = classifier_bucket_chapters()
+        scopes = [s for s in self._requestedScopes if s in bucket_chapters]
+        if not scopes:
+            scopes = classifier_fallback_scopes()
+
+        wanted_chapters: set[str] = set()
+        for scope in scopes:
+            wanted_chapters |= set(bucket_chapters[scope])
+
+        rows_by_domain_scope: dict[str, list[dict[str, str]]] = {s: [] for s in scopes}
+        if not wanted_chapters:
+            self._rowsByDomainScope = rows_by_domain_scope
+            return rows_by_domain_scope
+
         conn = _connect_db()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM cn_table")
+            cur.execute(
+                "SELECT * FROM cn_table WHERE chapter = ANY(%s)",
+                (sorted(wanted_chapters),),
+            )
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, row)) for row in cur.fetchall()]
             cur.close()
         finally:
             _release_db(conn)
 
-        rows_by_domain_scope: dict[str, list[dict[str, str]]] = {
-            "food_16_21": [],
-            "cosmetics": [],
-        }
         for row in rows:
             normalized = {str(k): "" if v is None else str(v) for k, v in row.items()}
             chapter = (normalized.get("chapter", "") or normalized.get("hs2_code", "")).zfill(2)
-            if chapter in {"16", "17", "18", "19", "20", "21"}:
-                rows_by_domain_scope["food_16_21"].append(normalized)
-            if chapter in {"32", "33"}:
-                rows_by_domain_scope["cosmetics"].append(normalized)
+            for scope in scopes:
+                if chapter in bucket_chapters[scope]:
+                    rows_by_domain_scope[scope].append(normalized)
 
         self._rowsByDomainScope = rows_by_domain_scope
         return rows_by_domain_scope
@@ -844,14 +1025,33 @@ def pes_to_input(pes: dict, *, domain_scope: str = "food_16_21") -> ProductClass
     else:
         ocr_text = str(ocr_chunks)
     ocr_text = _clean_classifier_ocr_text(ocr_text)
-    composition = _clean_classifier_fact_texts(obs.get("composition") or [])
+    fact_texts = []
+    for key in ("composition", "classification_input_fact_texts"):
+        value = obs.get(key) or []
+        if isinstance(value, list):
+            fact_texts.extend(value)
+        else:
+            fact_texts.append(str(value))
+    composition = _clean_classifier_fact_texts(fact_texts)
+    domain_scopes = obs.get("domain_scopes") or []
+    if not isinstance(domain_scopes, list):
+        domain_scopes = [str(domain_scopes)]
+    domain_scopes = [str(s) for s in domain_scopes if str(s).strip()] or [domain_scope]
+
+    structured_facts = obs.get("classification_input_product_facts") or []
+    if not isinstance(structured_facts, list):
+        structured_facts = [structured_facts]
+    structured_facts = [x for x in structured_facts if isinstance(x, dict)]
 
     return ProductClassificationInput(
         productName=obs.get("product_name") or "",
         shortDescription=obs.get("description") or "",
         productDomain=domain_scope,
-        domainScopes=[domain_scope],
+        domainScopes=domain_scopes,
         normalizedOcrFactTexts=composition,
+        structuredProductFacts=structured_facts,
+        unresolvedProductFacts=obs.get("unresolved_product_facts") or [],
+        productFactConflicts=obs.get("product_fact_conflicts") or [],
         ocrText=ocr_text,
     )
 
@@ -868,8 +1068,16 @@ def run_external_classifier(
 ) -> ExternalClassificationResult:
     productInput = pes_to_input(pes, domain_scope=domain_scope)
 
-    # 2. Retrieval
-    retriever = SupabaseCnCandidateRetriever(ASAP_ONTOLOGY_ROOT, ASAP_PROJECT_ROOT)
+    # 2. Retrieval — build CN buckets only for the scopes this product routed
+    # to (9 semantic groups, lazily). NB: build_semantic_candidate_index caches
+    # a single global index; it is currently disabled (heuristic-only), so
+    # per-request scoping is safe. If embeddings are re-enabled, that global
+    # index must be made scope-aware to match this per-request retriever.
+    retriever = SupabaseCnCandidateRetriever(
+        ASAP_ONTOLOGY_ROOT,
+        ASAP_PROJECT_ROOT,
+        requestedScopes=productInput.domainScopes,
+    )
     semanticIndex, semanticStatus = build_semantic_candidate_index(retriever)
     if semanticIndex is None:
         candidates = retriever.FindCandidates(productInput, topK=top_k_candidates)

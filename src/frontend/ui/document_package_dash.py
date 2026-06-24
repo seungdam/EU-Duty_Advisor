@@ -21,7 +21,7 @@ from errno import EADDRINUSE
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(os.environ.get("ASAP_PROJECT_ROOT", Path(__file__).resolve().parents[2])).resolve()
+PROJECT_ROOT = Path(os.environ.get("ASAP_PROJECT_ROOT", Path(__file__).resolve().parents[3])).resolve()
 for _path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
     if _path.exists() and str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
@@ -798,7 +798,7 @@ def document_view_context(pkg: dict[str, Any]) -> dict[str, Any] | None:
     preferential = sections.get("preferential_evidence") or {}
     required_docs = sections.get("required_documents") or {}
     product = sections.get("product_regulations") or {}
-    checklist = sections.get("document_checklist") or {}
+    checklist = sections.get("baseline_documents") or {}
     pre_taric_checks = sections.get("pre_taric_checks") or {}
 
     reqs = pkg.get("requirements") or []
@@ -811,6 +811,8 @@ def document_view_context(pkg: dict[str, Any]) -> dict[str, Any] | None:
     product_reqs = product.get("requirements") or []
 
     return {
+        "taric10": view.get("taric10") or pkg.get("taric10"),
+        "cn8": view.get("cn8") or pkg.get("cn8"),
         "kr": kr,
         "non_kr": non_kr,
         "controls": controls,
@@ -990,6 +992,7 @@ def render_result(pkg, panel, options):
     panel_defs = [
         ("overview", "전체 결론", "요약"),
         ("scenario", "시나리오", "기본/우대"),
+        ("checklist", "제출서류", f"{len(baseline_documents)}건"),
         ("bundles", "추가 상세서류", f"{len(additional_documents) or len(groups)}개"),
     ]
 
@@ -1089,6 +1092,27 @@ def render_panel(pkg: dict[str, Any], panel: str, cx: dict[str, Any], options: l
             cx.get("product_pre") or [],
             cx.get("product_post") or [],
             cx.get("related_declarations") or {},
+        )
+    if panel == "checklist":
+        documents = cx.get("baseline_documents") or []
+        pre_checks = cx.get("pre_taric_checks") or []
+        # cx["document_checklist"] = sections["baseline_documents"] = {requirements, documents}
+        checklist = dict(cx.get("document_checklist") or {})
+        # derive counts from documents so render_document_checklist metric grid is populated
+        counts = {
+            "total": len(documents),
+            "required": sum(1 for d in documents if str(d.get("decision_status") or d.get("required_level") or "").lower() in ("required", "필수")),
+            "conditional": sum(1 for d in documents if str(d.get("decision_status") or d.get("required_level") or "").lower() in ("conditional", "조건부")),
+            "pending": sum(1 for d in documents if str(d.get("decision_status") or d.get("required_level") or "").lower() in ("pending", "판단보류", "needs_review")),
+            "with_pre_links": sum(1 for d in documents if d.get("pre_taric_links")),
+            "with_post_links": sum(1 for d in documents if d.get("post_taric_links")),
+        }
+        checklist["counts"] = counts
+        return render_document_checklist(
+            documents,
+            pre_checks,
+            checklist,
+            cx.get("groups") or [],
         )
     return render_overview(cx, options, pkg)
 

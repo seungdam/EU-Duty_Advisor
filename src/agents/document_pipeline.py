@@ -20,8 +20,10 @@ for _path in (PROJECT_ROOT, SRC_ROOT):
 
 from agents.classification_agent import ClassificationAgent
 from agents.document_agent import DocumentAgent
+from agents.domain_router_agent import DomainRouterAgent
 from agents.evidence_intake_agent import EvidenceIntakeAgent
 from agents.orchestrator_agent import OrchestratorAgent
+from agents.product_understanding_agent import ProductUnderstandingAgent
 from agents.blackboard import BlackboardStore
 from bussiness_logic.app_config import LoadAppConfig
 
@@ -447,7 +449,7 @@ def run_document_pipeline(
     include_celex_excerpt: bool = False,
     progress_callback=None,
 ) -> dict[str, Any]:
-    """Run Evidence -> Classification -> Document -> Orchestrator.
+    """Run Evidence -> ProductUnderstanding -> DomainRouter -> Classification -> Document -> Orchestrator.
 
     Return shape:
       {
@@ -481,6 +483,8 @@ def run_document_pipeline(
 
     agents = [
         EvidenceIntakeAgent(raw_input),
+        ProductUnderstandingAgent(),
+        DomainRouterAgent(),
         ClassificationAgent(),
         DocumentAgent(include_celex_excerpt=include_celex_excerpt),
         OrchestratorAgent(),

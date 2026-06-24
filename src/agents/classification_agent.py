@@ -19,11 +19,20 @@ from dataclasses import asdict, is_dataclass
 
 from agents._external_classifier import (
     ExternalClassificationResult,
+    buckets_for_chapters,
+    classifier_fallback_scopes,
+    normalize_router_scope,
     run_external_classifier,
 )
 from agents.agent_base import BaseAgent
 from agents.tools import TaricBranchResolverTool
 from agents.blackboard import BlackboardStore, now_iso
+
+
+# Classifier candidate buckets follow the WCO 9-group scheme defined in
+# agents._external_classifier (single source of truth). DomainRouter candidate
+# chapters are mapped to bucket keys via buckets_for_chapters() at the
+# router/classifier boundary in _with_routing_context below.
 
 
 def _read_field(obj, *names, default=None):
@@ -63,6 +72,12 @@ class ClassificationAgent(BaseAgent):
         if not pes:
             raise RuntimeError("No ProductEvidenceState on the Blackboard.")
         self.read_input(pes["product_id"])
+        product_understanding = bb.get("product_understanding") or {}
+        routing_context = bb.get("routing_context") or {}
+        if product_understanding.get("understanding_id"):
+            self.read_input(product_understanding["understanding_id"])
+        if routing_context.get("routing_context_id"):
+            self.read_input(routing_context["routing_context_id"])
 
         # Step 0 — handle pending challenges first. If another agent has
         # raised an open challenge against one of our candidates, write a
@@ -72,7 +87,12 @@ class ClassificationAgent(BaseAgent):
             self._respond_to_challenges(store, open_challenges)
             return
 
-        result: ExternalClassificationResult = run_external_classifier(pes)
+        classifier_pes = self._with_routing_context(
+            pes,
+            product_understanding=product_understanding,
+            routing_context=routing_context,
+        )
+        result: ExternalClassificationResult = run_external_classifier(classifier_pes)
 
         # Cite candidates from the retriever (every shortlisted CN8).
         for c in result.citations:
@@ -203,6 +223,84 @@ class ClassificationAgent(BaseAgent):
         for c in ccs_candidates:
             self.wrote(c["candidate_id"])
 
+    def _with_routing_context(
+        self,
+        pes: dict,
+        *,
+        product_understanding: dict,
+        routing_context: dict,
+    ) -> dict:
+        """Add ProductUnderstanding/DomainRouter hints without hard filtering."""
+        out = dict(pes)
+        obs = dict(pes.get("observed_facts") or {})
+        hint_lines: list[str] = []
+
+        if product_understanding:
+            obs["product_understanding"] = product_understanding
+            processing_state = product_understanding.get("processing_state")
+            if processing_state:
+                hint_lines.append(f"ProductUnderstanding processing_state: {processing_state}")
+            keywords = product_understanding.get("routing_terms") or product_understanding.get("keywords") or []
+            if keywords:
+                hint_lines.append("ProductUnderstanding routing terms: " + ", ".join(str(k) for k in keywords[:30]))
+
+        if routing_context:
+            obs["routing_context"] = routing_context
+            candidate_chapters = [
+                str(c.get("chapter")).zfill(2)
+                for c in (routing_context.get("candidate_chapters") or [])
+                if c.get("chapter")
+            ]
+            obs["candidate_chapters"] = candidate_chapters
+
+            # Deterministic chapter -> WCO group / demo sub-bucket. This replaces
+            # keyword-based scope routing, so every chapter resolves to a real
+            # bucket (full 01-97 coverage) instead of mis-routing into food /
+            # cosmetics. Falls back to the legacy regulatory-scope map, then to
+            # the demo buckets, when no candidate chapter is available.
+            bucket_scopes = buckets_for_chapters(candidate_chapters)
+            scope_source = "candidate_chapters"
+            if not bucket_scopes:
+                for raw in routing_context.get("domain_scopes") or []:
+                    bucket = normalize_router_scope(raw)
+                    if bucket and bucket not in bucket_scopes:
+                        bucket_scopes.append(bucket)
+                scope_source = "regulatory_domain_scopes"
+            if not bucket_scopes:
+                bucket_scopes = classifier_fallback_scopes()
+                scope_source = "demo_fallback"
+            obs["domain_scopes"] = bucket_scopes
+            self.reason(
+                f"Classifier buckets {bucket_scopes} via {scope_source} "
+                f"(router chapters={candidate_chapters[:5]})."
+            )
+
+            for c in (routing_context.get("candidate_chapters") or [])[:5]:
+                hint_lines.append(
+                    "DomainRouter chapter candidate: "
+                    f"{c.get('chapter')} {c.get('chapter_title') or ''}; "
+                    f"confidence={c.get('confidence')}; "
+                    f"matched_terms={', '.join(str(t) for t in (c.get('matched_terms') or [])[:12])}"
+                )
+            blocked = routing_context.get("blocked_chapters") or []
+            if blocked:
+                hint_lines.append(
+                    "DomainRouter guardrail blocked raw chapters: "
+                    + "; ".join(
+                        f"{b.get('chapter')} -> {','.join(b.get('redirect_chapters') or [])}"
+                        for b in blocked[:5]
+                    )
+                )
+
+        original = obs.get("classification_input_fact_texts") or []
+        if not isinstance(original, list):
+            original = [str(original)]
+        obs["classification_input_fact_texts"] = [*hint_lines, *original]
+        out["observed_facts"] = obs
+        if hint_lines:
+            self.reason(f"Added {len(hint_lines)} ProductUnderstanding/DomainRouter hint line(s) to classifier input.")
+        return out
+
     def _resolve_taric_branches(self, cn8: str) -> list[dict]:
         if not cn8 or cn8 == "99999999":
             return []
@@ -254,8 +352,8 @@ class ClassificationAgent(BaseAgent):
                 break
 
         if not shortlist:
-            self.reason("No retriever shortlist available for fallback candidates.")
-            return False
+            self.reason("No retriever shortlist available; trying LLM classifier fallback.")
+            return self._emit_llm_classifier_fallback(store, pes, why=why)
 
         ccs_id = store.next_id("ccs")
         candidates: list[dict] = []
@@ -316,6 +414,120 @@ class ClassificationAgent(BaseAgent):
         self.reason(
             f"LLM classification unresolved ({why}); wrote {len(candidates)} "
             "retriever fallback candidate(s) for downstream TARIC/document checks."
+        )
+        return True
+
+    # ----------------------------------------------------- llm_classifier fallback
+    def _emit_llm_classifier_fallback(
+        self,
+        store: BlackboardStore,
+        pes: dict,
+        *,
+        why: str,
+        top_k: int = 5,
+    ) -> bool:
+        """LLM-classifier-based fallback when ASAPExpress retriever returns nothing.
+
+        Used when Korean-only product evidence prevents the keyword retriever
+        from shortlisting any cn_table row. Falls back to llm_classifier which
+        runs embedding + LLM over the full cn_table to propose candidates.
+        """
+        from agents.llm_classifier import classify as llm_classify
+
+        obs = pes.get("observed_facts") or {}
+        parts: list[str] = []
+        if obs.get("product_name"):
+            parts.append(f"product_name: {obs['product_name']}")
+        if obs.get("page_title"):
+            parts.append(f"page_title: {obs['page_title']}")
+        if obs.get("description"):
+            parts.append(f"description: {obs['description']}")
+        comp = obs.get("composition")
+        if isinstance(comp, list) and comp:
+            joined = "\n".join(str(c) for c in comp if c)[:2000]
+            if joined:
+                parts.append(f"composition:\n{joined}")
+        product_input = "\n".join(parts).strip()
+        if not product_input:
+            self.reason("LLM fallback skipped: empty product_input.")
+            return False
+
+        try:
+            results = llm_classify(product_input, top_k=top_k)
+        except Exception as exc:  # pragma: no cover — fallback never raises upward
+            self.reason(f"LLM classifier exception: {exc}")
+            return False
+
+        if not results:
+            self.reason("LLM classifier produced no candidates.")
+            return False
+
+        ccs_id = store.next_id("ccs")
+        candidates: list[dict] = []
+        for rank, r in enumerate(results, start=1):
+            cn8 = str(r.get("결정세번") or r.get("cn8") or "").strip()
+            cn8 = "".join(ch for ch in cn8 if ch.isdigit())[:8]
+            if len(cn8) != 8:
+                continue
+            taric_branches = self._resolve_taric_branches(cn8)
+            selected_branch = self._select_taric_branch(taric_branches)
+            taric10 = selected_branch.get("taric10") or ""
+            cand_id = store.next_id("cand")
+            try:
+                confidence = float(r.get("신뢰도") or r.get("confidence") or 0.3)
+            except (TypeError, ValueError):
+                confidence = 0.3
+            reason_txt = str(r.get("분류사유_영문") or r.get("reason") or "")[:300]
+            candidates.append({
+                "candidate_id": cand_id,
+                "hs6": cn8[:6],
+                "cn8": cn8,
+                "taric10": taric10,
+                "taric10_branch_candidates": taric_branches,
+                "taric10_resolution_mode": (
+                    "enumerate_all_under_cn8" if taric_branches else "no_taric_branch_found"
+                ),
+                "taric10_is_recommended": False,
+                "taric10_branch_count": len(taric_branches),
+                "selected_taric10_reason": (
+                    selected_branch.get("selection_reason")
+                    if taric10 else "No TARIC10 branch resolved from current master table."
+                ),
+                "primary_taric10_reason": (
+                    selected_branch.get("selection_reason")
+                    if taric10 else "No TARIC10 branch resolved from current master table."
+                ),
+                "rank": rank,
+                "confidence": round(max(0.0, min(1.0, confidence)), 3),
+                "status": "proposed",
+                "candidate_source": "llm_classifier_fallback",
+                "classification_basis": [
+                    f"LLM classifier fallback because retriever failed: {why}",
+                    reason_txt or f"LLM ranked {rank} for cn8 {cn8}.",
+                ],
+                "classification_citations": [],
+                "required_facts": [],
+                "unknowns": [why],
+            })
+
+        if not candidates:
+            self.reason("LLM classifier returned rows but none parsed to valid CN8.")
+            return False
+
+        store.append("candidate_code_sets", {
+            "object_type": "CandidateCodeSet",
+            "created_by": self.agent_name,
+            "created_at": now_iso(),
+            "candidate_set_id": ccs_id,
+            "product_id": pes["product_id"],
+            "candidates": candidates,
+        })
+        self.wrote(ccs_id)
+        for c in candidates:
+            self.wrote(c["candidate_id"])
+        self.reason(
+            f"LLM classifier fallback produced {len(candidates)} candidate(s) "
+            f"(top1 cn8={candidates[0]['cn8']})."
         )
         return True
 
