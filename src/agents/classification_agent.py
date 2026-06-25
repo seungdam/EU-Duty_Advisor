@@ -237,6 +237,13 @@ class ClassificationAgent(BaseAgent):
 
         if product_understanding:
             obs["product_understanding"] = product_understanding
+            # B-2: the tariff-nomenclature English translation is the strongest
+            # retrieval signal — prepend it so it leads the classifier search
+            # text (the English cn_table descriptions match it, not the Korean).
+            classification_text_en = (product_understanding.get("classification_text_en") or "").strip()
+            if classification_text_en:
+                obs["classification_text_en"] = classification_text_en
+                hint_lines.append(f"Tariff-nomenclature product description: {classification_text_en}")
             processing_state = product_understanding.get("processing_state")
             if processing_state:
                 hint_lines.append(f"ProductUnderstanding processing_state: {processing_state}")

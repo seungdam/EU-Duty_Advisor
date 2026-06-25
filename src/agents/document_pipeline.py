@@ -115,8 +115,15 @@ def collect_kurly_url_facts(
         runtime_adapter = None
         if smoke_config.use_llm_input_reconstruction:
             try:
+                # Reconstruction is fact-extraction, not the final tariff
+                # decision — run it on a fast, non-thinking model (gemma3:4b) so
+                # it does not time out the way gemma4-ctx (heavy thinking) does.
+                recon_config = BuildLlmRuntimeConfigFromEnv(projectRootPath=PROJECT_ROOT)
+                recon_model = os.environ.get("ASAP_RECONSTRUCTION_MODEL", "gemma3:4b")
+                if recon_model:
+                    recon_config = recon_config.model_copy(update={"modelName": recon_model})
                 runtime_adapter = BuildRuntimeAdapter(
-                    BuildLlmRuntimeConfigFromEnv(projectRootPath=PROJECT_ROOT),
+                    recon_config,
                     requireAvailable=True,
                 )
             except RuntimeAdapterBuildError as exc:

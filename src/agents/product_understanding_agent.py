@@ -11,8 +11,85 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import os
+from pathlib import Path
+
 from agents.agent_base import BaseAgent
 from agents.blackboard import BlackboardStore, now_iso
+
+# B-2: a lightweight, non-thinking model translates the cleaned Korean product
+# facts into ONE English description phrased in HS/CN tariff nomenclature so it
+# matches the English cn_table descriptions the retriever scores against. The
+# heavy classification model (gemma4-ctx) is left untouched; translation is a
+# separate cheap step (~1-2s on gemma3:4b).
+_TRANSLATION_MODEL = os.environ.get("ASAP_TRANSLATION_MODEL", "gemma3:4b")
+_TRANSLATION_SYSTEM_PROMPT = (
+    "You are a customs tariff classification assistant. Convert a Korean "
+    "food/cosmetic product into ONE concise English sentence phrased in HS/CN "
+    "tariff nomenclature vocabulary. Use tariff terms where they apply, e.g. "
+    "'prepared or preserved', 'not stuffed', 'cooked/uncooked', 'frozen', "
+    "'dried', 'in airtight containers', 'containing ... by weight', the physical "
+    "form, the processing/preparation state, and the single ingredient that "
+    "gives the product its essential character. Output only that English "
+    "description. No HS/CN codes, no commentary, no Korean."
+)
+_translation_adapter_cache: list = []
+
+
+def _translation_adapter():
+    """Build (once) an Ollama RuntimeAdapter pinned to the translation model."""
+    if _translation_adapter_cache:
+        return _translation_adapter_cache[0]
+    from bussiness_logic.bridge import (
+        BuildDefaultLlmRuntimeConfig,
+        BuildLlmRuntimeConfigFromEnv,
+        BuildRuntimeAdapter,
+        ProbeRuntimeDependency,
+    )
+
+    env_path = Path(
+        os.environ.get("ASAP_PROJECT_ROOT", Path(__file__).resolve().parents[2])
+    ) / ".env"
+    try:
+        config = BuildLlmRuntimeConfigFromEnv(envFilePath=env_path)
+    except Exception:  # noqa: BLE001 - fall back to defaults if .env missing
+        config = BuildDefaultLlmRuntimeConfig()
+    config = config.model_copy(update={"modelName": _TRANSLATION_MODEL})
+    adapter = BuildRuntimeAdapter(config, ProbeRuntimeDependency(config))
+    _translation_adapter_cache.append(adapter)
+    return adapter
+
+
+def translate_to_tariff_english(product_name: str, fact_texts: list[str]) -> str:
+    """Korean product facts -> one tariff-nomenclature English sentence.
+
+    Returns "" on any failure so the pipeline degrades to the Korean text
+    rather than breaking.
+    """
+    facts = "; ".join(t for t in fact_texts[:20] if t.strip())
+    if not (product_name.strip() or facts.strip()):
+        return ""
+    from bussiness_logic.bridge.schema import (
+        LlmGenerationOptions,
+        LlmRequest,
+        LlmResponseFormat,
+    )
+
+    request = LlmRequest(
+        user_prompt=(
+            f"Korean product: {product_name}\n"
+            f"Facts/ingredients: {facts}\n"
+            "Tariff-style English description:"
+        ),
+        system_prompt=_TRANSLATION_SYSTEM_PROMPT,
+        response_format=LlmResponseFormat.TEXT,
+        generation_options=LlmGenerationOptions(temperature=0.0, max_tokens=200),
+    )
+    try:
+        response = _translation_adapter().Generate(request)
+        return (getattr(response, "generatedText", "") or "").strip()
+    except Exception:  # noqa: BLE001 - translation is best-effort
+        return ""
 
 
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_/-]{2,}|[가-힣]{2,}|\d+(?:[.,]\d+)?\s*%?")
@@ -121,7 +198,7 @@ def _match_signals(patterns: list[tuple[str, str]], text: str) -> list[dict[str,
 class ProductUnderstandingAgent(BaseAgent):
     agent_name = "Product_Understanding_Agent"
     stage = "ProductUnderstanding"
-    llm_model = None
+    llm_model = _TRANSLATION_MODEL
 
     def run(self, store: BlackboardStore) -> None:
         bb = store.load()
@@ -151,6 +228,14 @@ class ProductUnderstandingAgent(BaseAgent):
         )
         lower_text = classification_text.lower()
 
+        # B-2: translate the cleaned Korean facts into tariff-nomenclature English
+        # so the retriever (which scores against English cn_table descriptions)
+        # can surface the right candidates. Best-effort; "" on failure.
+        classification_text_en = translate_to_tariff_english(
+            product_name,
+            _dedupe([description, *fact_texts], limit=40),
+        )
+
         processing_signals = _match_signals(PROCESSED_SIGNAL_PATTERNS, classification_text)
         raw_signals = _match_signals(RAW_SIGNAL_PATTERNS, classification_text)
         domain_hints = _match_signals(DOMAIN_HINT_PATTERNS, classification_text)
@@ -171,6 +256,7 @@ class ProductUnderstandingAgent(BaseAgent):
             "product_name": product_name,
             "short_description": description,
             "classification_text": classification_text[:12000],
+            "classification_text_en": classification_text_en[:2000],
             "classification_text_line_count": len([x for x in classification_text.splitlines() if x.strip()]),
             "keywords": keywords,
             "processing_state": processing_state,
