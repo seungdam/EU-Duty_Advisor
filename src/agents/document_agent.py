@@ -28,6 +28,7 @@ LLM 호출 없음 — current MVP. CELEX 본문 해석/카드 생성 LLM 통합�
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 from agents.agent_base import BaseAgent
@@ -90,6 +91,14 @@ def _cert_kind(code: str) -> str:
 
 def _compact_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"true", "t", "1", "yes", "y"}
 
 
 def _first_text(*values: Any) -> str:
@@ -323,7 +332,10 @@ class DocumentAgent(BaseAgent):
 
             # Sentinel: needs_more_facts candidates → no package, only signal.
             if (cand.get("status") or "").strip() != "proposed" or not taric_targets:
-                self._emit_unresolved_package(store, cand)
+                reason = "candidate_unresolved"
+                if (cand.get("status") or "").strip() == "proposed" and not taric_targets:
+                    reason = "no_declarable_taric10_branch"
+                self._emit_unresolved_package(store, cand, reason=reason)
                 continue
 
             for target in taric_targets:
@@ -381,10 +393,14 @@ class DocumentAgent(BaseAgent):
                     reason="DocumentPackageTool source.",
                 )
 
-                # 2. Regulatory domain (fast-path)
+                # 2. Regulatory domain. Prefer upstream RoutingContext so
+                # baseline/pre-TARIC scope is not silently recomputed from CN8.
                 measure_hints = [r.get("measure_type") for r in requirements_raw if r.get("measure_type")]
-                dom = self._domain_tool.route(
-                    cn8=cn8, product_facts=product_facts, measure_type_hints=measure_hints,
+                dom = (
+                    self._domain_result_from_routing_context(routing_context, cn8)
+                    or self._domain_tool.route(
+                        cn8=cn8, product_facts=product_facts, measure_type_hints=measure_hints,
+                    )
                 )
                 for ev in dom.evidence:
                     self.cite("Domain_Scope_Routes", str(ev.get("chapter") or ev.get("source") or ""),
@@ -479,9 +495,17 @@ class DocumentAgent(BaseAgent):
         targets: list[dict[str, Any]] = []
         seen: set[str] = set()
         if branches:
+            has_declarable_flag = any(
+                isinstance(branch, dict) and "is_declarable_leaf" in branch
+                for branch in branches
+            )
+            skipped_non_declarable = 0
             for branch in branches:
                 taric10 = _compact_text(branch.get("taric10"))
                 if not taric10 or taric10.startswith("99999999") or taric10 in seen:
+                    continue
+                if has_declarable_flag and not _truthy(branch.get("is_declarable_leaf")):
+                    skipped_non_declarable += 1
                     continue
                 seen.add(taric10)
                 targets.append({
@@ -489,6 +513,11 @@ class DocumentAgent(BaseAgent):
                     "branch": dict(branch),
                     "resolution_mode": cand.get("taric10_resolution_mode") or "enumerate_all_under_cn8",
                 })
+            if skipped_non_declarable:
+                self.reason(
+                    f"Skipped {skipped_non_declarable} non-declarable TARIC branch(es) "
+                    f"for candidate {cand.get('candidate_id')} CN8={cand.get('cn8')}."
+                )
         else:
             taric10 = _compact_text(cand.get("taric10"))
             if taric10 and not taric10.startswith("99999999"):
@@ -503,6 +532,37 @@ class DocumentAgent(BaseAgent):
             target["branch_index"] = index
             target["branch_count"] = count
         return targets
+
+    def _domain_result_from_routing_context(self, routing_context: dict, cn8: str):
+        if not routing_context:
+            return None
+        domains = list(routing_context.get("domain_scopes") or [])
+        pre_gate_domains = list(routing_context.get("pre_gate_domains") or [])
+        if not domains and not pre_gate_domains:
+            return None
+        candidates = routing_context.get("candidate_chapters") or []
+        chapter = cn8[:2]
+        matched = next(
+            (
+                c for c in candidates
+                if str(c.get("chapter") or "").zfill(2) == chapter
+            ),
+            candidates[0] if candidates else {},
+        )
+        confidence = matched.get("confidence")
+        if confidence is None:
+            confidence = routing_context.get("confidence", 0.8)
+        return SimpleNamespace(
+            domains=domains or ["other"],
+            pre_gate_domains=pre_gate_domains,
+            chapter=chapter,
+            confidence=confidence,
+            decided_by="routing_context",
+            reason="Reused upstream RoutingContext for DocumentAgent scope.",
+            missing_facts=list(routing_context.get("missing_facts") or []),
+            evidence=list(routing_context.get("evidence") or []),
+            is_ambiguous=bool(routing_context.get("conflicts")),
+        )
 
     def _split_requirements_for_view(
         self,
@@ -558,6 +618,12 @@ class DocumentAgent(BaseAgent):
                 "Pre-TARIC screening requirements",
             )
         ]
+        taric_triggered_details = [
+            detail
+            for req in kr
+            for detail in (req.get("detailed_requirements") or [])
+            if detail.get("source_layer") == "taric_triggered"
+        ]
         product_details = [
             detail
             for req in product_reqs
@@ -580,12 +646,31 @@ class DocumentAgent(BaseAgent):
         binding_documents = checklist.get("document_binding_cards") or []
         document_groups = checklist.get("document_groups") or []
         missing = raw.get("missing_facts") or checklist.get("missing_facts") or []
+        total_measure_rows = int(raw.get("total_measure_rows") or 0)
+        if total_measure_rows <= 0:
+            post_taric_status = "no_taric_measure_rows"
+            post_taric_message = (
+                "No current TARIC measure rows were found for this TARIC10. "
+                "Baseline and pre-TARIC checks are still shown when routed."
+            )
+        elif not taric_triggered_details:
+            post_taric_status = "no_post_taric_requirement_match"
+            post_taric_message = (
+                "No curated post-TARIC document requirement matched the current "
+                "measure/certificate/legal-base context. Baseline and pre-TARIC "
+                "documents may still be required."
+            )
+        else:
+            post_taric_status = "post_taric_requirements_found"
+            post_taric_message = "Post-TARIC requirement rows matched this TARIC context."
 
         return {
             "source": "DocumentAgent.document_view.v1",
             "taric10": raw.get("taric10"),
             "cn8": raw.get("cn8"),
-            "total_measure_rows": raw.get("total_measure_rows"),
+            "total_measure_rows": total_measure_rows,
+            "post_taric_status": post_taric_status,
+            "post_taric_message": post_taric_message,
             "domains": list(getattr(dom, "domains", []) or []),
             "domain_confidence": getattr(dom, "confidence", None),
             "metrics": {
@@ -601,6 +686,7 @@ class DocumentAgent(BaseAgent):
                 "product_rule_count": len(product_details),
                 "product_pre_count": len(pre_details),
                 "product_post_count": len(post_details),
+                "taric_triggered_post_count": len(taric_triggered_details),
                 "missing_count": len(missing),
                 "document_binding_count": len(binding_documents),
             },
@@ -629,6 +715,16 @@ class DocumentAgent(BaseAgent):
                 "required_documents": {
                     "agent_bucket": required_documents,
                     "document_groups": document_groups,
+                },
+                "pre_taric_checks": {
+                    "checks": pre_details,
+                    "source": "pre_taric_requirement_master",
+                },
+                "post_taric_requirements": {
+                    "status": post_taric_status,
+                    "message": post_taric_message,
+                    "details": taric_triggered_details,
+                    "source": "post_taric_requirement_master",
                 },
                 "baseline_documents": {
                     "requirements": baseline_reqs,
