@@ -92,9 +92,9 @@ _CITES_CHAPTER_HINTS: set[str] = {"01", "02", "03", "05", "06", "12", "13", "33"
 
 # 명백한 키워드 → 도메인 (product_name 에 등장 시)
 _KEYWORD_TO_DOMAIN: list[tuple[re.Pattern, list[str]]] = [
-    (re.compile(r"\b(lipstick|mascara|foundation|perfume|cologne|cream|lotion|cosmetic|shampoo|skincare|toner|essence)\b", re.I),
+    (re.compile(r"\b(lipstick|mascara|foundation|perfume|cologne|lotion|cosmetic|shampoo|skincare|toner|essence|(?:skin|face|body|moisturizing)\s+cream)\b", re.I),
      ["cosmetics"]),
-    (re.compile(r"\b(립스틱|마스카라|파운데이션|향수|크림|로션|화장품|샴푸|스킨|토너|에센스)\b"),
+    (re.compile(r"\b(립스틱|마스카라|파운데이션|향수|로션|화장품|샴푸|스킨케어|토너|에센스)\b"),
      ["cosmetics"]),
     (re.compile(r"\b(pharmaceutical|medicine|drug|tablet|capsule|antibiotic|vaccine)\b", re.I),
      ["pharmaceutical"]),
@@ -110,11 +110,54 @@ _KEYWORD_TO_DOMAIN: list[tuple[re.Pattern, list[str]]] = [
 # chapter keywords are English-only but evidence is Korean OCR text.
 _PRODUCT_FORM_TO_CHAPTER: list[tuple[re.Pattern, str, str]] = [
     (re.compile(r"\b(noodle|ramen|pasta|macaroni|spaghetti)\b|라면|유탕면|국수|면류|파스타"), "19", "cereal/noodle preparation"),
-    (re.compile(r"\b(sauce|seasoning|condiment|soup|broth|stock)\b|소스|양념|조미|스프|국|탕|찌개|육수"), "21", "miscellaneous edible preparation"),
-    (re.compile(r"\b(dumpling|mandu|sausage|ham|surimi)\b|만두|소시지|햄|어묵|맛살|멘보샤"), "16", "meat/fish/crustacean preparation"),
+    (re.compile(r"\b(sauce|seasoning|condiment|soup|broth|stock)\b|소스|양념|조미|스프|미역국|국물|탕|찌개|육수"), "21", "miscellaneous edible preparation"),
+    (re.compile(r"\b(sausage|ham|surimi)\b|소시지|햄|어묵|맛살|멘보샤"), "16", "meat/fish/crustacean preparation"),
+    (re.compile(r"\b(dumpling|mandu|stuffed pasta|stuffed noodles)\b|만두|물만두|군만두"), "19", "stuffed pasta/cereal preparation"),
     (re.compile(r"\b(jam|pickle|fruit preparation|vegetable preparation)\b|잼|절임|피클|과실가공|채소가공"), "20", "vegetable/fruit preparation"),
     (re.compile(r"\b(beverage|drink|juice|tea)\b|음료|주스|차음료"), "22", "beverage"),
+    (re.compile(r"\b(deodorant|antiperspirant|roll[- ]?on|cosmetic|skincare|perfume|lotion|shampoo|toner|essence)\b|데오드란트|데오도란트|롤온|화장품|스킨케어|향수|로션|샴푸|토너|에센스"), "33", "cosmetic/toilet preparation"),
 ]
+
+
+# Single-word chapter-title leftovers are too broad for routing. Keep phrases
+# such as "animal origin" or "toilet preparations"; suppress only standalone
+# generic tokens from chapter_keywords. Prepared/raw scope signals are handled
+# separately and are not filtered through this set.
+_GENERIC_CHAPTER_KEYWORD_STOPLIST: set[str] = {
+    "animal",
+    "edible",
+    "essential",
+    "included",
+    "miscellaneous",
+    "natural",
+    "origin",
+    "other",
+    "prepared",
+    "preparation",
+    "preparations",
+    "produce",
+    "product",
+    "products",
+    "specified",
+    "toilet",
+    "containing",
+    "containers",
+}
+
+_RAW_INGREDIENT_CHAPTERS_FOR_PREPARED_FOOD: set[str] = {
+    "02",
+    "03",
+    "04",
+    "07",
+    "08",
+    "09",
+    "10",
+    "11",
+    "12",
+    "13",
+    "14",
+    "15",
+}
 
 
 @dataclass
@@ -284,14 +327,50 @@ class DomainRouterTool:
     @staticmethod
     def _term_matches(terms: list[str], haystack: str) -> list[str]:
         out: list[str] = []
-        normalized = f" {re.sub(r'\\s+', ' ', haystack or '').lower()} "
+        normalized = re.sub(r"\s+", " ", haystack or "").lower()
         for term in terms:
             term_norm = re.sub(r"\s+", " ", str(term or "").strip().lower())
             if len(term_norm) < 2:
                 continue
-            if term_norm in normalized and term not in out:
+            # English/number terms use token boundaries to avoid substring
+            # false positives. Korean tariff phrases do not have whitespace
+            # tokenization, so keep exact phrase containment for Hangul terms.
+            if re.fullmatch(r"[a-z0-9][a-z0-9 /'&().-]*", term_norm, flags=re.I):
+                pattern = r"(?<![a-z0-9])" + re.escape(term_norm) + r"(?![a-z0-9])"
+                matched = re.search(pattern, normalized, flags=re.I) is not None
+            else:
+                matched = term_norm in normalized
+            if matched and term not in out:
                 out.append(term)
         return out
+
+    @staticmethod
+    def _filter_chapter_keyword_terms(terms: list[str]) -> list[str]:
+        filtered: list[str] = []
+        for term in terms:
+            term_norm = re.sub(r"\s+", " ", str(term or "").strip().lower())
+            if not term_norm:
+                continue
+            if " " not in term_norm and term_norm in _GENERIC_CHAPTER_KEYWORD_STOPLIST:
+                continue
+            filtered.append(term)
+        return filtered
+
+    @staticmethod
+    def _flatten_string_values(value: Any) -> list[str]:
+        out: list[str] = []
+        if value is None:
+            return out
+        if isinstance(value, dict):
+            for item in value.values():
+                out.extend(DomainRouterTool._flatten_string_values(item))
+            return out
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                out.extend(DomainRouterTool._flatten_string_values(item))
+            return out
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        return [text] if text else []
 
     def route_product(
         self,
@@ -307,14 +386,61 @@ class DomainRouterTool:
         guardrail evidence, especially raw-vs-prepared food redirects.
         """
         product_facts = product_facts or {}
+        # Only the structured ProductUnderstanding description is safe for
+        # chapter routing. The legacy one-sentence translation is kept for
+        # CN retriever compatibility, but it can hallucinate tariff terms like
+        # "stuffed" and must not become chapter evidence.
+        normalized_description = product_understanding.get("normalized_tariff_description") or ""
+        keyword_map = product_understanding.get("keyword_map") or {}
+        excluded_terms = {
+            str(item.get("term") or "").strip().lower()
+            for item in (
+                (product_understanding.get("blocked_routing_terms") or [])
+                + (product_understanding.get("excluded_from_routing_terms") or [])
+            )
+            if isinstance(item, dict) and str(item.get("term") or "").strip()
+        }
+        structured_terms = self._flatten_string_values({
+            "translated_product_name": product_understanding.get("translated_product_name") or "",
+            "commercial_identity": product_understanding.get("commercial_identity") or "",
+            "keyword_map": keyword_map,
+            "chapter_routing_terms": product_understanding.get("chapter_routing_terms") or [],
+            "routing_keywords": product_understanding.get("routing_keywords") or [],
+            "routing_terms": product_understanding.get("routing_terms") or [],
+            "product_form_terms": product_understanding.get("product_form_terms") or [],
+            "processing_terms": product_understanding.get("processing_terms") or [],
+            "principal_ingredient_terms": product_understanding.get("principal_ingredient_terms") or [],
+            "ingredient_taxonomy_terms": product_understanding.get("ingredient_taxonomy_terms") or [],
+            "composition_terms": product_understanding.get("composition_terms") or [],
+            "use_context_terms": product_understanding.get("use_context_terms") or [],
+            "keywords": product_understanding.get("keywords") or [],
+        })
+        structured_terms = [
+            term for term in structured_terms if term.lower() not in excluded_terms
+        ]
         text_parts = [
-            product_understanding.get("classification_text") or "",
-            " ".join(product_understanding.get("keywords") or []),
-            " ".join(product_understanding.get("routing_terms") or []),
+            product_understanding.get("classification_text") if not normalized_description else "",
+            # The LLM translation is useful for the CN retriever, but too
+            # noisy for chapter routing: it can hallucinate tariff phrases
+            # like "frozen" or "airtight containers" from OCR context.
+            product_understanding.get("translated_product_name") or "",
+            product_understanding.get("commercial_identity") or "",
+            normalized_description,
+            " ".join(structured_terms),
             product_facts.get("product_name") or "",
             product_facts.get("description") or "",
         ]
         haystack = "\n".join(str(p) for p in text_parts if p)
+        sauce_product = re.search(
+            r"\b(sauce|condiment|seasoning)\b|소스|양념",
+            haystack,
+            flags=re.I,
+        ) is not None
+        explicit_noodle_product = re.search(
+            r"\b(noodle|ramen|macaroni|spaghetti)\b|라면|유탕면|국수|면류",
+            haystack,
+            flags=re.I,
+        ) is not None
         processing_state = product_understanding.get("processing_state") or "unknown"
         processed = processing_state == "processed_or_prepared" or bool(
             product_understanding.get("processing_signals")
@@ -331,7 +457,9 @@ class DomainRouterTool:
             chapter = str(row.get("chapter") or "").zfill(2)
             if not chapter:
                 continue
-            keyword_terms = self._split_values(row.get("chapter_keywords") or "")
+            keyword_terms = self._filter_chapter_keyword_terms(
+                self._split_values(row.get("chapter_keywords") or "")
+            )
             prepared_terms = self._split_values(row.get("prepared_scope_signals") or "")
             raw_terms = self._split_values(row.get("raw_scope_signals") or "")
             domain_terms = self._split_values(row.get("domain_scope_candidates") or "")
@@ -339,34 +467,83 @@ class DomainRouterTool:
             keyword_matches = self._term_matches(keyword_terms, haystack)
             prepared_matches = self._term_matches(prepared_terms, haystack)
             raw_matches = self._term_matches(raw_terms, haystack)
-            score = float(len(keyword_matches) * 4)
-            if processed:
-                score += len(prepared_matches) * 5
-                if raw_matches:
-                    score -= 2
-            else:
-                score += len(raw_matches) * 3
 
             form_matches: list[str] = []
             for pattern, target_chapter, reason in _PRODUCT_FORM_TO_CHAPTER:
                 m = pattern.search(haystack)
                 if m and target_chapter == chapter:
-                    score += 8.0
+                    if (
+                        sauce_product
+                        and target_chapter == "19"
+                        and not explicit_noodle_product
+                        and re.search(r"\bpasta\b|파스타", m.group(0), flags=re.I)
+                    ):
+                        continue
                     form_matches.append(f"{m.group(0)}:{reason}")
 
             redirects = self._split_values(row.get("prepared_food_redirect_chapters") or "")
-            if processed and raw_matches and redirects:
+            raw_chapter_evidence = bool(keyword_matches or raw_matches)
+            guardrail_text = str(row.get("routing_guardrails") or "").lower()
+            raw_redirect_guardrail = "before raw ingredient chapter" in guardrail_text
+            if (
+                processed
+                and raw_redirect_guardrail
+                and raw_chapter_evidence
+                and (raw_matches or prepared_matches)
+                and redirects
+            ):
                 blocked.append({
                     "chapter": chapter,
                     "chapter_title": row.get("chapter_title") or "",
                     "reason": "processed_product_guardrail_redirect",
                     "matched_raw_terms": raw_matches,
+                    "matched_prepared_terms": prepared_matches,
                     "redirect_chapters": redirects,
+                    "blocking_rule": "processed_or_prepared_product_cannot_be_routed_by_raw_scope_terms",
                 })
                 for redirect in redirects:
                     redirect_chapter = re.sub(r"\D", "", redirect)[:2].zfill(2)
                     if redirect_chapter:
                         redirect_bonus[redirect_chapter] = redirect_bonus.get(redirect_chapter, 0.0) + 5.0
+                # Hard block: official/prepared-vs-raw exclusions are
+                # eligibility gates, not small scoring penalties.
+                continue
+
+            # Keyword/form evidence creates chapter eligibility. Processing
+            # scope terms such as "prepared" or "preparations" only adjust an
+            # already plausible chapter; they must not create candidates alone.
+            score = float(len(keyword_matches) * 4 + len(form_matches) * 8)
+            if score <= 0:
+                continue
+            if processed:
+                score += len(prepared_matches) * 2
+                if raw_matches:
+                    score -= 2
+            else:
+                score += len(raw_matches) * 3
+
+            if sauce_product:
+                if chapter == "21":
+                    score += 4
+                elif (
+                    chapter == "19"
+                    and not explicit_noodle_product
+                    and any("pasta" in str(m).lower() or "파스타" in str(m) for m in keyword_matches)
+                ):
+                    score -= 4
+                elif (
+                    processed
+                    and chapter in _RAW_INGREDIENT_CHAPTERS_FOR_PREPARED_FOOD
+                    and not form_matches
+                ):
+                    blocked.append({
+                        "chapter": chapter,
+                        "chapter_title": row.get("chapter_title") or "",
+                        "reason": "prepared_sauce_raw_ingredient_lowered",
+                        "matched_terms": keyword_matches + prepared_matches + raw_matches,
+                        "blocking_rule": "sauce_or_condiment_product_should_not_route_by_raw_ingredient_terms",
+                    })
+                    continue
 
             if score <= 0:
                 continue
@@ -428,6 +605,24 @@ class DomainRouterTool:
                     ),
                     "prepared_food_redirect_chapters": [],
                 }
+        if not scores and "cosmetics" in domain_hints:
+            chapter = "33"
+            row = row_by_chapter.get(chapter, {})
+            scores[chapter] = {
+                "chapter": chapter,
+                "chapter_title": row.get("chapter_title") or "",
+                "score": 12.0,
+                "matched_terms": ["cosmetics_domain_hint"],
+                "keyword_matches": [],
+                "prepared_matches": [],
+                "raw_matches": [],
+                "routing_summary": row.get("routing_summary") or "",
+                "routing_guardrails": row.get("routing_guardrails") or "",
+                "classification_decision_axes": self._split_values(
+                    row.get("classification_decision_axes") or ""
+                ),
+                "prepared_food_redirect_chapters": [],
+            }
 
         ranked = sorted(scores.values(), key=lambda x: (-float(x.get("score") or 0), x.get("chapter") or ""))
         max_score = float(ranked[0]["score"]) if ranked else 0.0
@@ -464,6 +659,8 @@ class DomainRouterTool:
                 "table": "cn_chapter_index",
                 "top_k": top_k,
                 "processed_guardrail_applied": bool(blocked),
+                "product_understanding_mode": product_understanding.get("product_understanding_mode") or "",
+                "used_normalized_tariff_description": bool(normalized_description),
             },
             "missing_facts": [
                 "primary_ingredient_ratio"

@@ -721,6 +721,18 @@ DEMO_BUCKET_CHAPTERS: dict[str, frozenset[str]] = {
     "cosmetics": frozenset({"32", "33"}),
 }
 
+
+def classifier_demo_scope_only() -> bool:
+    """Whether CN retrieval is restricted to demo buckets.
+
+    WCO groups remain defined as the future/full classifier partition, but the
+    current demo should not silently search non-food/cosmetic groups when the
+    DomainRouter points outside chapters 16-21 or 32-33. Set
+    ASAP_CLASSIFIER_DEMO_ONLY=0 to enable all WCO groups in experiments.
+    """
+    raw = os.environ.get("ASAP_CLASSIFIER_DEMO_ONLY", "1")
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
 # Pre-gate / screening scopes are document concerns (sanctions = ALL chapters,
 # cites = species screening), never CN candidate buckets. Kept for the
 # domain_scope_routes loader used elsewhere.
@@ -779,12 +791,16 @@ def load_domain_scope_route_chapters() -> dict[str, frozenset[str]]:
 def classifier_bucket_chapters() -> dict[str, frozenset[str]]:
     """Effective bucket_key -> chapters for CN candidate retrieval (cached).
 
-    = 9 WCO groups (full 01-97 coverage) + 2 narrow demo sub-buckets.
+    Demo default = food_16_21 + cosmetics only.
+    Full experiment = 9 WCO groups (01-97 coverage) + 2 narrow demo sub-buckets.
     """
     global _CLASSIFIER_BUCKET_CHAPTERS
     if _CLASSIFIER_BUCKET_CHAPTERS is not None:
         return _CLASSIFIER_BUCKET_CHAPTERS
-    _CLASSIFIER_BUCKET_CHAPTERS = {**WCO_GROUP_CHAPTERS, **DEMO_BUCKET_CHAPTERS}
+    if classifier_demo_scope_only():
+        _CLASSIFIER_BUCKET_CHAPTERS = {**DEMO_BUCKET_CHAPTERS}
+    else:
+        _CLASSIFIER_BUCKET_CHAPTERS = {**WCO_GROUP_CHAPTERS, **DEMO_BUCKET_CHAPTERS}
     return _CLASSIFIER_BUCKET_CHAPTERS
 
 
@@ -800,6 +816,8 @@ def bucket_for_chapter(chapter: str) -> str | None:
         return None
     if ch in _CHAPTER_TO_DEMO_BUCKET:
         return _CHAPTER_TO_DEMO_BUCKET[ch]
+    if classifier_demo_scope_only():
+        return None
     for group_key, chapters in WCO_GROUP_CHAPTERS.items():
         if ch in chapters:
             return group_key
@@ -813,6 +831,16 @@ def buckets_for_chapters(chapters) -> list[str]:
         bucket = bucket_for_chapter(ch)
         if bucket and bucket not in out:
             out.append(bucket)
+    return out
+
+
+def unsupported_classifier_chapters(chapters) -> list[str]:
+    """Chapters that DomainRouter proposed but enabled classifier scopes block."""
+    out: list[str] = []
+    for ch in chapters or []:
+        normalized = str(ch or "").strip().zfill(2)
+        if normalized and bucket_for_chapter(normalized) is None and normalized not in out:
+            out.append(normalized)
     return out
 
 

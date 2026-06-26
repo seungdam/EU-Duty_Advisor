@@ -23,6 +23,7 @@ from agents._external_classifier import (
     classifier_fallback_scopes,
     normalize_router_scope,
     run_external_classifier,
+    unsupported_classifier_chapters,
 )
 from agents.agent_base import BaseAgent
 from agents.tools import TaricBranchResolverTool
@@ -92,6 +93,15 @@ class ClassificationAgent(BaseAgent):
             product_understanding=product_understanding,
             routing_context=routing_context,
         )
+        obs_for_scope = classifier_pes.get("observed_facts") or {}
+        if obs_for_scope.get("classification_scope_status") == "unsupported_demo_scope":
+            self._emit_scope_unsupported(
+                store,
+                classifier_pes,
+                chapters=obs_for_scope.get("unsupported_classifier_chapters") or [],
+                buckets=obs_for_scope.get("enabled_classifier_buckets") or [],
+            )
+            return
         result: ExternalClassificationResult = run_external_classifier(classifier_pes)
 
         # Cite candidates from the retriever (every shortlisted CN8).
@@ -109,7 +119,7 @@ class ClassificationAgent(BaseAgent):
 
         if result.error:
             self.reason(f"ASAPExpress classifier returned error: {result.error}")
-            if not self._emit_retriever_fallback(store, pes, why=result.error):
+            if not self._emit_retriever_fallback(store, classifier_pes, why=result.error):
                 self._emit_unresolved(store, pes, why=result.error)
             return
 
@@ -122,7 +132,7 @@ class ClassificationAgent(BaseAgent):
         recommendation = result.recommendation
         if recommendation is None:
             self.reason("No Stage1RecommendationReport produced; emitting needs_more_facts.")
-            if not self._emit_retriever_fallback(store, pes, why="no_recommendation"):
+            if not self._emit_retriever_fallback(store, classifier_pes, why="no_recommendation"):
                 self._emit_unresolved(store, pes, why="no_recommendation")
             return
 
@@ -267,7 +277,17 @@ class ClassificationAgent(BaseAgent):
             # the demo buckets, when no candidate chapter is available.
             bucket_scopes = buckets_for_chapters(candidate_chapters)
             scope_source = "candidate_chapters"
-            if not bucket_scopes:
+            unsupported_chapters = unsupported_classifier_chapters(candidate_chapters)
+            if candidate_chapters and not bucket_scopes:
+                obs["classification_scope_status"] = "unsupported_demo_scope"
+                obs["unsupported_classifier_chapters"] = unsupported_chapters
+                obs["enabled_classifier_buckets"] = classifier_fallback_scopes()
+                self.reason(
+                    "DomainRouter chapters are outside enabled classifier demo scopes; "
+                    f"blocked before CN retrieval. chapters={candidate_chapters[:5]} "
+                    f"enabled={classifier_fallback_scopes()}"
+                )
+            elif not bucket_scopes:
                 for raw in routing_context.get("domain_scopes") or []:
                     bucket = normalize_router_scope(raw)
                     if bucket and bucket not in bucket_scopes:
@@ -277,6 +297,8 @@ class ClassificationAgent(BaseAgent):
                 bucket_scopes = classifier_fallback_scopes()
                 scope_source = "demo_fallback"
             obs["domain_scopes"] = bucket_scopes
+            if unsupported_chapters:
+                obs["unsupported_classifier_chapters"] = unsupported_chapters
             self.reason(
                 f"Classifier buckets {bucket_scopes} via {scope_source} "
                 f"(router chapters={candidate_chapters[:5]})."
@@ -307,6 +329,38 @@ class ClassificationAgent(BaseAgent):
         if hint_lines:
             self.reason(f"Added {len(hint_lines)} ProductUnderstanding/DomainRouter hint line(s) to classifier input.")
         return out
+
+    def _emit_scope_unsupported(
+        self,
+        store: BlackboardStore,
+        pes: dict,
+        *,
+        chapters: list[str],
+        buckets: list[str],
+    ) -> None:
+        ccs_id = store.next_id("ccs")
+        reason = (
+            "DomainRouter top chapters are outside the currently enabled demo "
+            "classifier scopes. WCO groups are retained in code but disabled "
+            "for this demo run."
+        )
+        store.append("candidate_code_sets", {
+            "object_type": "CandidateCodeSet",
+            "created_by": self.agent_name,
+            "created_at": now_iso(),
+            "candidate_set_id": ccs_id,
+            "product_id": pes["product_id"],
+            "classification_status": "unsupported_demo_scope",
+            "failure_reason": reason,
+            "candidate_chapters": list(chapters),
+            "enabled_classifier_buckets": list(buckets),
+            "candidates": [],
+        })
+        self.wrote(ccs_id)
+        self.reason(
+            f"Classification blocked by demo scope gate. "
+            f"router_chapters={chapters or '-'} enabled_buckets={buckets or '-'}."
+        )
 
     def _resolve_taric_branches(self, cn8: str) -> list[dict]:
         if not cn8 or cn8 == "99999999":
@@ -443,6 +497,14 @@ class ClassificationAgent(BaseAgent):
 
         obs = pes.get("observed_facts") or {}
         parts: list[str] = []
+        product_understanding = obs.get("product_understanding") or {}
+        if isinstance(product_understanding, dict):
+            classification_text_en = (product_understanding.get("classification_text_en") or "").strip()
+            classification_text = (product_understanding.get("classification_text") or "").strip()
+            if classification_text_en:
+                parts.append(f"tariff_nomenclature_description_en:\n{classification_text_en}")
+            if classification_text:
+                parts.append(f"product_understanding_text:\n{classification_text[:3000]}")
         if obs.get("product_name"):
             parts.append(f"product_name: {obs['product_name']}")
         if obs.get("page_title"):
@@ -459,8 +521,14 @@ class ClassificationAgent(BaseAgent):
             self.reason("LLM fallback skipped: empty product_input.")
             return False
 
+        chapter_hint = ",".join(
+            str(chapter).zfill(2)
+            for chapter in (obs.get("candidate_chapters") or [])[:5]
+            if str(chapter).strip()
+        )
+
         try:
-            results = llm_classify(product_input, top_k=top_k)
+            results = llm_classify(product_input, top_k=top_k, chapter_hint=chapter_hint)
         except Exception as exc:  # pragma: no cover — fallback never raises upward
             self.reason(f"LLM classifier exception: {exc}")
             return False
@@ -510,6 +578,7 @@ class ClassificationAgent(BaseAgent):
                 "candidate_source": "llm_classifier_fallback",
                 "classification_basis": [
                     f"LLM classifier fallback because retriever failed: {why}",
+                    f"DomainRouter chapter_hint={chapter_hint or '-'}",
                     reason_txt or f"LLM ranked {rank} for cn8 {cn8}.",
                 ],
                 "classification_citations": [],

@@ -32,6 +32,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from agents.agent_base import BaseAgent
+from agents.dto import DocBaseSet_dto, DocPostSet_dto, DocPreSet_dto
 from agents.tools import DocumentPackageTool, DomainRouterTool
 from agents.blackboard import BlackboardStore, now_iso
 
@@ -321,6 +322,7 @@ class DocumentAgent(BaseAgent):
         self.read_input(latest["candidate_set_id"])
 
         product_facts = pes.get("observed_facts") or {}
+        product_understanding = bb.get("product_understanding") or {}
         routing_context = bb.get("routing_context") or {}
         if routing_context.get("routing_context_id"):
             self.read_input(routing_context["routing_context_id"])
@@ -412,6 +414,7 @@ class DocumentAgent(BaseAgent):
                 required_documents = self._extract_required_documents(requirements_raw)
                 product_regulations = self._build_product_regulations(dom)
                 basic_duty = self._pick_basic_duty(duties, raw)
+                dp_id = store.next_id("dp")
                 document_view = self._build_document_view(
                     raw=raw,
                     dom=dom,
@@ -421,6 +424,11 @@ class DocumentAgent(BaseAgent):
                     required_documents=required_documents,
                     product_regulations=product_regulations,
                     basic_duty=basic_duty,
+                    document_package_id=dp_id,
+                    candidate_id=cand["candidate_id"],
+                    source_codeset_id=latest.get("candidate_set_id") or "",
+                    source_product_facts_id=product_understanding.get("understanding_id") or "",
+                    source_routing_context_id=routing_context.get("routing_context_id") or "",
                 )
 
                 # 4. CELEX basis (collect all legal bases referenced)
@@ -436,7 +444,6 @@ class DocumentAgent(BaseAgent):
                 if dom.is_ambiguous:
                     missing_facts.append("regulatory_domain_ambiguous")
 
-                dp_id = store.next_id("dp")
                 dp = {
                     "object_type": "DocumentPackage",
                     "created_by": self.agent_name,
@@ -595,6 +602,11 @@ class DocumentAgent(BaseAgent):
         required_documents: list[dict],
         product_regulations: list[dict],
         basic_duty: dict,
+        document_package_id: str = "",
+        candidate_id: str = "",
+        source_codeset_id: str = "",
+        source_product_facts_id: str = "",
+        source_routing_context_id: str = "",
     ) -> dict[str, Any]:
         """Render-independent document package view model.
 
@@ -664,6 +676,60 @@ class DocumentAgent(BaseAgent):
             post_taric_status = "post_taric_requirements_found"
             post_taric_message = "Post-TARIC requirement rows matched this TARIC context."
 
+        base_set = DocBaseSet_dto(
+            source="DocumentAgent._build_document_view",
+            document_package_id=document_package_id,
+            candidate_id=candidate_id,
+            source_product_facts_id=source_product_facts_id,
+            source_routing_context_id=source_routing_context_id,
+            taric10=raw.get("taric10"),
+            cn8=raw.get("cn8"),
+            table_reads=[
+                {"table_name": "baseline_document_master", "role": "baseline document shell"},
+                {"table_name": "document_binding", "role": "baseline/pre/post field binding"},
+            ],
+            requirements=baseline_reqs,
+            documents=binding_documents or [_enrich_baseline_doc(d) for d in baseline_details],
+            missing_facts=missing,
+            metrics={
+                "requirement_count": len(baseline_reqs),
+                "document_count": len(binding_documents) or len(baseline_details),
+            },
+        )
+        pre_set = DocPreSet_dto(
+            source="DocumentAgent._build_document_view",
+            document_package_id=document_package_id,
+            candidate_id=candidate_id,
+            source_product_facts_id=source_product_facts_id,
+            source_routing_context_id=source_routing_context_id,
+            taric10=raw.get("taric10"),
+            cn8=raw.get("cn8"),
+            table_reads=[
+                {"table_name": "pre_taric_requirement_master", "role": "chapter/domain/pre-gate screening"},
+            ],
+            checks=pre_details,
+            missing_facts=missing,
+            metrics={"check_count": len(pre_details)},
+        )
+        post_set = DocPostSet_dto(
+            source="DocumentAgent._build_document_view",
+            document_package_id=document_package_id,
+            candidate_id=candidate_id,
+            source_codeset_id=source_codeset_id,
+            taric10=raw.get("taric10"),
+            cn8=raw.get("cn8"),
+            table_reads=[
+                {"table_name": "post_taric_requirement_master", "role": "TARIC measure/certificate requirement"},
+                {"table_name": "taric_certificate_declaration_guidance", "role": "certificate/declaration guidance"},
+                {"table_name": "taric_celex_table", "role": "legal basis evidence"},
+            ],
+            status=post_taric_status,
+            message=post_taric_message,
+            requirements=taric_triggered_details,
+            missing_facts=missing,
+            metrics={"requirement_count": len(taric_triggered_details)},
+        )
+
         return {
             "source": "DocumentAgent.document_view.v1",
             "taric10": raw.get("taric10"),
@@ -689,6 +755,11 @@ class DocumentAgent(BaseAgent):
                 "taric_triggered_post_count": len(taric_triggered_details),
                 "missing_count": len(missing),
                 "document_binding_count": len(binding_documents),
+            },
+            "dto_sets": {
+                "baseline": base_set,
+                "pre_taric": pre_set,
+                "post_taric": post_set,
             },
             "sections": {
                 "overview": {

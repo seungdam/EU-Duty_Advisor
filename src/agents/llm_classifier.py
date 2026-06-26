@@ -459,10 +459,41 @@ def _lexical_prefilter(query: str, rows: Iterable[dict[str, Any]], limit: int) -
     return [row for _, _, row in scored[:limit]]
 
 
-def search_cn_candidates(product_input: str, top_k: int = 40) -> list[dict[str, Any]]:
+def _parse_chapter_hints(chapter_hint: str | None) -> set[str]:
+    chapters: set[str] = set()
+    for token in re.findall(r"\d{1,2}", str(chapter_hint or "")):
+        if token:
+            chapter = token.zfill(2)
+            if "01" <= chapter <= "99":
+                chapters.add(chapter)
+    return chapters
+
+
+def search_cn_candidates(
+    product_input: str,
+    top_k: int = 40,
+    chapter_hint: str | None = None,
+) -> list[dict[str, Any]]:
     rows = _load_cn_rows()
     expanded_input = _expand_query(product_input)
-    prefiltered = _lexical_prefilter(expanded_input, rows, TOP_PREFILTER_ROWS)
+    chapter_hints = _parse_chapter_hints(chapter_hint)
+    if chapter_hints:
+        hinted_rows = [
+            row
+            for row in rows
+            if str(row.get("chapter") or _candidate_code(row)[:2]).zfill(2) in chapter_hints
+        ]
+        hinted_limit = max(80, int(TOP_PREFILTER_ROWS * 0.65))
+        global_limit = max(40, TOP_PREFILTER_ROWS - hinted_limit)
+        prefiltered = _lexical_prefilter(expanded_input, hinted_rows, hinted_limit)
+        seen = {_candidate_code(row) for row in prefiltered}
+        for row in _lexical_prefilter(expanded_input, rows, global_limit):
+            code = _candidate_code(row)
+            if code not in seen:
+                prefiltered.append(row)
+                seen.add(code)
+    else:
+        prefiltered = _lexical_prefilter(expanded_input, rows, TOP_PREFILTER_ROWS)
     candidate_texts = [_candidate_search_text(row) for row in prefiltered]
     query_tokens = _tokenize(expanded_input)
 
@@ -486,6 +517,8 @@ def search_cn_candidates(product_input: str, top_k: int = 40) -> list[dict[str, 
             text_tokens = _tokenize(candidate_texts[idx])
             semantic_similarity = min(1.0, len(query_tokens & text_tokens) / 8.0)
         boost = _keyword_boost(expanded_input, row)
+        if chapter_hints and str(row.get("chapter") or code[:2]).zfill(2) in chapter_hints:
+            boost += 0.25
         similarity = semantic_similarity + boost
         ranked.append(
             {
@@ -602,8 +635,9 @@ def get_last_trace() -> dict[str, Any]:
 def classify(product_input: str, top_k: int = 5, chapter_hint: str | None = None) -> list[dict[str, Any]]:
     """Return classifier rows compatible with ``classifier_ab_smoke``.
 
-    ``chapter_hint`` is accepted for backward compatibility; this cn_table engine
-    currently lets embedding + LLM choose from active candidates instead.
+    ``chapter_hint`` is used as a soft boost, not a hard filter.  DomainRouter
+    can therefore steer the candidate set without making wrong chapter routing
+    irreversible.
     """
 
     print(f"\n{'=' * 60}")
@@ -617,7 +651,11 @@ def classify(product_input: str, top_k: int = 5, chapter_hint: str | None = None
             flush=True,
         )
 
-    candidates = search_cn_candidates(sanitized_input, top_k=max(LLM_CANDIDATE_COUNT, top_k))
+    candidates = search_cn_candidates(
+        sanitized_input,
+        top_k=max(LLM_CANDIDATE_COUNT, top_k),
+        chapter_hint=chapter_hint,
+    )
     if not candidates:
         LAST_CLASSIFY_TRACE.clear()
         LAST_CLASSIFY_TRACE.update(
@@ -629,6 +667,7 @@ def classify(product_input: str, top_k: int = 5, chapter_hint: str | None = None
                 "removed_allergen_fragments": removed_allergen_fragments[:80],
                 "removed_allergen_count": len(removed_allergen_fragments),
                 "candidate_payload": [],
+                "chapter_hint": chapter_hint or "",
                 "output_hs6": [],
                 "output_cn8": [],
                 "parse_ok": False,
@@ -640,6 +679,7 @@ def classify(product_input: str, top_k: int = 5, chapter_hint: str | None = None
     decision, trace = _llm_select_with_trace(sanitized_input, candidates)
     trace["raw_input"] = product_input[:12000]
     trace["sanitized_input"] = sanitized_input[:12000]
+    trace["chapter_hint"] = chapter_hint or ""
     trace["removed_allergen_fragments"] = removed_allergen_fragments[:80]
     trace["removed_allergen_count"] = len(removed_allergen_fragments)
     ranked = decision.get("ranked") if isinstance(decision, dict) else None
