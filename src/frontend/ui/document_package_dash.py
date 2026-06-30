@@ -774,6 +774,8 @@ def _unresolved_context(pkg: dict[str, Any]) -> dict[str, Any]:
         "product_pre": [],
         "product_post": [],
         "related_declarations": {},
+        "post_taric_status": "",
+        "post_taric_message": "",
         "source": "unresolved",
         "_raw_package": pkg,
     }
@@ -832,6 +834,8 @@ def document_view_context(pkg: dict[str, Any]) -> dict[str, Any] | None:
         "product_pre": product.get("pre") or [],
         "product_post": product.get("post") or [],
         "related_declarations": product.get("related_declarations") or {},
+        "post_taric_status": view.get("post_taric_status") or "",
+        "post_taric_message": view.get("post_taric_message") or "",
         "document_view": view,
         "source": "document_view",
     }
@@ -966,10 +970,12 @@ def select_panel(_clicks):
 def render_result(pkg, panel, options):
     if not pkg:
         return "TARIC 코드를 입력하거나 좌측 예제를 선택하세요."
-    if not pkg.get("has_data"):
-        return html.Div("이 코드에 대한 현재 적용 measure가 없습니다.", className="empty")
-
     cx = package_context(pkg)
+    if not pkg.get("has_data") and cx.get("source") != "document_view":
+        return html.Div(
+            "이 코드에 대한 현재 적용 measure가 없습니다. 다만 pipeline 결과에서는 baseline/pre-TARIC 문서가 별도로 표시될 수 있습니다.",
+            className="empty",
+        )
     if cx.get("source") == "unresolved":
         return render_unresolved(pkg, options or [])
     third_country = cx["third_country"]
@@ -1601,11 +1607,18 @@ def update_scenario_decision(selected_values, pkg):
 
 def render_overview(cx: dict[str, Any], options: list[str], pkg: dict[str, Any]):
     missing = cx["missing"]
+    post_status = cx.get("post_taric_status") or ""
+    post_message = cx.get("post_taric_message") or ""
     items = [
         ("TARIC 확인 코드", f"{len(cx['controls'])}개 control measure"),
         ("관세 시나리오", f"{len(cx['duties'])}개 duty/preference measure"),
         ("추가 상세서류", f"{len(_additional_detail_documents(cx.get('baseline_documents') or []) or cx['groups'])}개 chapter/domain document"),
     ]
+    if post_status in {"no_taric_measure_rows", "no_post_taric_requirement_match"}:
+        items.append((
+            "TARIC 상세 추가규제",
+            post_message or "현재 TARIC 상세 post requirement 매칭은 없지만 baseline/pre 문서는 별도로 확인합니다.",
+        ))
     left = html.Div(
         [
             html.Div("오늘 봐야 할 것", className="section-title"),
