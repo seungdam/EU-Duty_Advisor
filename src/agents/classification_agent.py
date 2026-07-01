@@ -26,7 +26,8 @@ from agents._external_classifier import (
     unsupported_classifier_chapters,
 )
 from agents.agent_base import BaseAgent
-from agents.tools import TaricBranchResolverTool
+from agents.dto import CN8Classify_dto, HS4Classify_dto, HS6Classify_dto
+from agents.tools import StagedClassificationTool, TaricBranchResolverTool
 from agents.blackboard import BlackboardStore, now_iso
 
 
@@ -66,6 +67,7 @@ class ClassificationAgent(BaseAgent):
     def __init__(self) -> None:
         super().__init__()
         self._taric_resolver = TaricBranchResolverTool()
+        self._staged_classifier = StagedClassificationTool()
 
     def run(self, store: BlackboardStore) -> None:
         bb = store.load()
@@ -102,6 +104,14 @@ class ClassificationAgent(BaseAgent):
                 buckets=obs_for_scope.get("enabled_classifier_buckets") or [],
             )
             return
+        if os.environ.get("ASAP_USE_STAGED_LLM_CLASSIFIER", "1") != "0":
+            if self._emit_staged_llm_classification(
+                store,
+                classifier_pes,
+                product_understanding=product_understanding,
+                routing_context=routing_context,
+            ):
+                return
         result: ExternalClassificationResult = run_external_classifier(classifier_pes)
 
         # Cite candidates from the retriever (every shortlisted CN8).
@@ -233,6 +243,167 @@ class ClassificationAgent(BaseAgent):
         for c in ccs_candidates:
             self.wrote(c["candidate_id"])
 
+    def _emit_staged_llm_classification(
+        self,
+        store: BlackboardStore,
+        pes: dict,
+        *,
+        product_understanding: dict,
+        routing_context: dict,
+    ) -> bool:
+        """Primary experimental path: ProductFacts_dto -> HS4 -> HS6 -> CN8.
+
+        The StagedClassificationTool reuses agents.llm_classifier.  This
+        method owns blackboard writes, so the tool remains a pure callable and
+        the durable artifacts are DTOs.
+        """
+        try:
+            result = self._staged_classifier.classify(
+                product_evidence=pes,
+                product_facts=product_understanding,
+                routing_context=routing_context,
+                top_k=int(os.environ.get("ASAP_STAGED_CLASSIFIER_TOP_K", "8")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.reason(f"StagedClassificationTool error; falling back to legacy classifier: {exc}")
+            return False
+
+        if not result.get("ok"):
+            self.reason(
+                "StagedClassificationTool produced no candidate; "
+                f"falling back to legacy classifier. error={result.get('error') or '-'}"
+            )
+            return False
+
+        stage_payloads = result.get("stage_payloads") or {}
+        stage_ids: dict[str, str] = {}
+        source_product_facts_id = (
+            product_understanding.get("understanding_id")
+            or product_understanding.get("source_product_facts_id")
+            or ""
+        )
+        source_routing_context_id = routing_context.get("routing_context_id") or ""
+        refs = {
+            "ProductFacts_dto": source_product_facts_id,
+            "Route_dto": source_routing_context_id,
+        }
+        dto_builders = [
+            ("hs4", HS4Classify_dto),
+            ("hs6", HS6Classify_dto),
+            ("cn8", CN8Classify_dto),
+        ]
+        for key, builder in dto_builders:
+            payload = stage_payloads.get(key)
+            if not isinstance(payload, dict):
+                continue
+            stage_id = store.next_id("cls")
+            stage_ids[key] = stage_id
+            dto = builder(
+                created_by=self.agent_name,
+                created_at=now_iso(),
+                classify_stage_id=stage_id,
+                product_id=pes["product_id"],
+                source_product_facts_id=source_product_facts_id,
+                source_routing_context_id=source_routing_context_id,
+                input_dto_refs=refs,
+                **payload,
+            )
+            store.append("classification_stage_results", dto)
+            self.wrote(stage_id)
+            for read in payload.get("table_reads") or []:
+                if isinstance(read, dict) and read.get("source_table") and read.get("source_id"):
+                    self.cite(
+                        str(read["source_table"]),
+                        str(read["source_id"]),
+                        snippet=str(read.get("snippet") or "")[:160],
+                        reason=str(read.get("reason") or "Staged classification table read."),
+                    )
+
+        candidates_in = result.get("candidates") or []
+        if not candidates_in:
+            self.reason("Staged classifier had stage DTOs but no CN8 candidates.")
+            return False
+
+        ccs_id = store.next_id("ccs")
+        ccs_candidates: list[dict] = []
+        for rank, row in enumerate(candidates_in, start=1):
+            cn8 = "".join(ch for ch in str(row.get("결정세번") or row.get("cn8") or "") if ch.isdigit())[:8]
+            if len(cn8) != 8:
+                continue
+            taric_branches = self._resolve_taric_branches(cn8)
+            selected_branch = self._select_taric_branch(taric_branches)
+            taric10 = selected_branch.get("taric10") or ""
+            cand_id = store.next_id("cand")
+            try:
+                confidence = float(row.get("신뢰도") or row.get("confidence") or 0.3)
+            except (TypeError, ValueError):
+                confidence = 0.3
+            reason_txt = str(row.get("분류사유_영문") or row.get("reason") or "")[:300]
+            ccs_candidates.append({
+                "candidate_id": cand_id,
+                "hs6": cn8[:6],
+                "cn8": cn8,
+                "taric10": taric10,
+                "taric10_branch_candidates": taric_branches,
+                "taric10_resolution_mode": (
+                    "enumerate_all_under_cn8" if taric_branches else "no_taric_branch_found"
+                ),
+                "taric10_is_recommended": False,
+                "taric10_branch_count": len(taric_branches),
+                "selected_taric10_reason": (
+                    selected_branch.get("selection_reason")
+                    if taric10 else "No TARIC10 branch resolved from current master table."
+                ),
+                "primary_taric10_reason": (
+                    selected_branch.get("selection_reason")
+                    if taric10 else "No TARIC10 branch resolved from current master table."
+                ),
+                "rank": rank,
+                "confidence": round(max(0.0, min(1.0, confidence)), 3),
+                "status": "proposed",
+                "candidate_source": "staged_llm_classifier",
+                "classification_stage_result_ids": list(stage_ids.values()),
+                "classification_basis": [
+                    "HS4/HS6/CN8 staged classifier using ProductFacts_dto + Route_dto.",
+                    reason_txt or f"Staged classifier ranked {rank} for CN8 {cn8}.",
+                ],
+                "classification_citations": list(self._ontology_reads),
+                "required_facts": [],
+                "unknowns": [],
+            })
+
+        if not ccs_candidates:
+            self.reason("Staged classifier returned rows but none parsed to valid CN8.")
+            return False
+
+        store.append("candidate_code_sets", {
+            "object_type": "CandidateCodeSet",
+            "dto_name": "CodeSet_dto",
+            "created_by": self.agent_name,
+            "created_at": now_iso(),
+            "candidate_set_id": ccs_id,
+            "product_id": pes["product_id"],
+            "classification_status": "staged_llm_classifier",
+            "source_classification_stage_result_ids": list(stage_ids.values()),
+            "classifier_trace": {
+                "provider": (result.get("trace") or {}).get("provider"),
+                "model": (result.get("trace") or {}).get("model"),
+                "parse_ok": (result.get("trace") or {}).get("parse_ok"),
+                "fallback_used": (result.get("trace") or {}).get("fallback_used"),
+                "chapter_hint": result.get("chapter_hint") or "",
+            },
+            "candidates": ccs_candidates,
+        })
+        self.wrote(ccs_id)
+        for candidate in ccs_candidates:
+            self.wrote(candidate["candidate_id"])
+        self.reason(
+            "Staged LLM classifier completed: "
+            f"stage_ids={list(stage_ids.values())}, candidates={len(ccs_candidates)}, "
+            f"top1={ccs_candidates[0]['cn8']}."
+        )
+        return True
+
     def _with_routing_context(
         self,
         pes: dict,
@@ -247,6 +418,17 @@ class ClassificationAgent(BaseAgent):
 
         if product_understanding:
             obs["product_understanding"] = product_understanding
+            projection = (
+                product_understanding.get("classifier_projection")
+                if isinstance(product_understanding.get("classifier_projection"), dict)
+                else {}
+            )
+            identity_context = str(projection.get("identity_context") or "").strip()
+            composition_context = str(projection.get("composition_context") or "").strip()
+            if identity_context:
+                hint_lines.append(f"Product identity context:\n{identity_context[:1800]}")
+            if composition_context:
+                hint_lines.append(f"Product composition context:\n{composition_context[:1800]}")
             # B-2: the tariff-nomenclature English translation is the strongest
             # retrieval signal — prepend it so it leads the classifier search
             # text (the English cn_table descriptions match it, not the Korean).
@@ -499,6 +681,17 @@ class ClassificationAgent(BaseAgent):
         parts: list[str] = []
         product_understanding = obs.get("product_understanding") or {}
         if isinstance(product_understanding, dict):
+            projection = (
+                product_understanding.get("classifier_projection")
+                if isinstance(product_understanding.get("classifier_projection"), dict)
+                else {}
+            )
+            identity_context = str(projection.get("identity_context") or "").strip()
+            composition_context = str(projection.get("composition_context") or "").strip()
+            if identity_context:
+                parts.append(f"product_identity_context:\n{identity_context[:2500]}")
+            if composition_context:
+                parts.append(f"product_composition_context:\n{composition_context[:2500]}")
             classification_text_en = (product_understanding.get("classification_text_en") or "").strip()
             classification_text = (product_understanding.get("classification_text") or "").strip()
             if classification_text_en:

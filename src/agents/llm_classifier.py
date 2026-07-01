@@ -37,12 +37,32 @@ def _load_local_env() -> None:
 _load_local_env()
 
 CN_TABLE_NAME = os.environ.get("ASAP_CN_TABLE_NAME", "cn_table")
-LLM_MODEL = os.environ.get("EU_EXPORT_LLM_MODEL", "gemma4-ctx")
+LLM_PROVIDER = (
+    os.environ.get("ASAP_ENGINE_LLM_PROVIDER")
+    or os.environ.get("EU_EXPORT_LLM_PROVIDER")
+    or "ollama"
+).strip().lower()
+LLM_MODEL = (
+    os.environ.get("ASAP_ENGINE_LLM_MODEL")
+    or os.environ.get("EU_EXPORT_LLM_MODEL")
+    or "gemma4-ctx"
+)
 OLLAMA_ENDPOINT = (
     os.environ.get("EU_EXPORT_OLLAMA_ENDPOINT_URL")
     or os.environ.get("OLLAMA_HOST")
     or "http://localhost:11434"
 ).rstrip("/")
+GEMINI_ENDPOINT = (
+    os.environ.get("ASAP_ENGINE_GEMINI_ENDPOINT_URL")
+    or os.environ.get("EU_EXPORT_LLM_ENDPOINT_URL")
+    or os.environ.get("EU_EXPORT_GOOGLE_AI_STUDIO_ENDPOINT_URL")
+    or "https://generativelanguage.googleapis.com/v1beta/openai"
+).rstrip("/")
+GEMINI_CHAT_COMPLETIONS_PATH = (
+    os.environ.get("ASAP_ENGINE_GEMINI_CHAT_COMPLETIONS_PATH")
+    or os.environ.get("EU_EXPORT_LLM_CHAT_COMPLETIONS_PATH")
+    or "/chat/completions"
+)
 EMBED_MODEL_NAME = os.environ.get(
     "ASAP_ENGINE_EMBED_MODEL",
     "paraphrase-multilingual-mpnet-base-v2",
@@ -50,6 +70,7 @@ EMBED_MODEL_NAME = os.environ.get(
 TOP_PREFILTER_ROWS = int(os.environ.get("ASAP_ENGINE_PREFILTER_ROWS", "450"))
 LLM_CANDIDATE_COUNT = int(os.environ.get("ASAP_ENGINE_LLM_CANDIDATES", "12"))
 LLM_TIMEOUT_SECONDS = int(os.environ.get("ASAP_ENGINE_LLM_TIMEOUT_SECONDS", "600"))
+LLM_DECISION_MAX_TOKENS = int(os.environ.get("ASAP_ENGINE_LLM_DECISION_MAX_TOKENS", "4096"))
 LAST_CLASSIFY_TRACE: dict[str, Any] = {}
 
 
@@ -542,6 +563,12 @@ def search_cn_candidates(
 
 
 def llm(prompt: str, max_tokens: int = 768) -> str:
+    if LLM_PROVIDER in {"gemini", "google", "google_ai_studio"}:
+        return _gemini_llm(prompt, max_tokens=max_tokens)
+    return _ollama_llm(prompt, max_tokens=max_tokens)
+
+
+def _ollama_llm(prompt: str, max_tokens: int = 768) -> str:
     try:
         response = requests.post(
             f"{OLLAMA_ENDPOINT}/api/chat",
@@ -557,6 +584,50 @@ def llm(prompt: str, max_tokens: int = 768) -> str:
         )
         response.raise_for_status()
         return response.json().get("message", {}).get("content", "").strip()
+    except Exception as exc:  # noqa: BLE001
+        return f"[LLM 오류: {exc}]"
+
+
+def _read_gemini_api_key() -> str:
+    for name in (
+        "ASAP_ENGINE_GEMINI_API_KEY",
+        "EU_EXPORT_GOOGLE_AI_STUDIO_API_KEY",
+        "GEMINI_API_KEY",
+        "EU_EXPORT_LLM_API_KEY",
+    ):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+def _gemini_llm(prompt: str, max_tokens: int = 768) -> str:
+    api_key = _read_gemini_api_key()
+    if not api_key:
+        return "[LLM 오류: Gemini API key is missing.]"
+    endpoint = f"{GEMINI_ENDPOINT}{GEMINI_CHAT_COMPLETIONS_PATH}"
+    try:
+        response = requests.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": LLM_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+                "max_tokens": max_tokens,
+            },
+            timeout=LLM_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        return str(message.get("content") or "").strip()
     except Exception as exc:  # noqa: BLE001
         return f"[LLM 오류: {exc}]"
 
@@ -610,10 +681,12 @@ def _llm_select_with_trace(
             json.dumps(candidate_payload, ensure_ascii=False),
         ]
     )
-    raw_response = llm(prompt, max_tokens=1024)
+    raw_response = llm(prompt, max_tokens=LLM_DECISION_MAX_TOKENS)
     parsed = parse_json(raw_response)
     trace = {
+        "provider": LLM_PROVIDER,
         "model": LLM_MODEL,
+        "endpoint": GEMINI_ENDPOINT if LLM_PROVIDER in {"gemini", "google", "google_ai_studio"} else OLLAMA_ENDPOINT,
         "ollama_endpoint": OLLAMA_ENDPOINT,
         "prompt": prompt,
         "prompt_length": len(prompt),
@@ -642,7 +715,10 @@ def classify(product_input: str, top_k: int = 5, chapter_hint: str | None = None
 
     print(f"\n{'=' * 60}")
     print(f"[분류 시작] {product_input[:120]!r}")
-    print(f"  cn_table 검색 source={CN_TABLE_NAME} model={LLM_MODEL}", flush=True)
+    print(
+        f"  cn_table 검색 source={CN_TABLE_NAME} provider={LLM_PROVIDER} model={LLM_MODEL}",
+        flush=True,
+    )
 
     sanitized_input, removed_allergen_fragments = _sanitize_classification_input(product_input)
     if removed_allergen_fragments:
@@ -660,7 +736,9 @@ def classify(product_input: str, top_k: int = 5, chapter_hint: str | None = None
         LAST_CLASSIFY_TRACE.clear()
         LAST_CLASSIFY_TRACE.update(
             {
+                "provider": LLM_PROVIDER,
                 "model": LLM_MODEL,
+                "endpoint": GEMINI_ENDPOINT if LLM_PROVIDER in {"gemini", "google", "google_ai_studio"} else OLLAMA_ENDPOINT,
                 "ollama_endpoint": OLLAMA_ENDPOINT,
                 "raw_input": product_input[:12000],
                 "sanitized_input": sanitized_input[:12000],

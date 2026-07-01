@@ -9,6 +9,18 @@ from __future__ import annotations
 from typing import Any
 
 
+def _compact_list(values: list[Any], *, limit: int = 80) -> list[Any]:
+    out: list[Any] = []
+    for value in values:
+        if value in (None, "", [], {}):
+            continue
+        if value not in out:
+            out.append(value)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def ProductFacts_dto(
     *,
     created_by: str,
@@ -48,6 +60,9 @@ def ProductFacts_dto(
     routing_terms: list[str],
     unknowns: list[str],
     evidence: dict[str, Any],
+    identity_lane: dict[str, Any] | None = None,
+    composition_lane: dict[str, Any] | None = None,
+    classifier_projection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Output answer shape for ProductUnderstandingAgent.
 
@@ -55,6 +70,71 @@ def ProductFacts_dto(
     - object_type remains ``ProductUnderstandingFacts`` for the existing store.
     - dto_name exposes the shorter contract name for new agents/docs.
     """
+    identity_lane = identity_lane or {
+        "raw_product_name": product_name,
+        "short_description": short_description,
+        "translated_product_name": translated_product_name,
+        "commercial_identity": commercial_identity,
+        "normalized_tariff_description": normalized_tariff_description,
+        "product_form_terms": product_form_terms,
+        "commodity_identity_terms": _compact_list(
+            [
+                translated_product_name,
+                commercial_identity,
+                normalized_tariff_description,
+                *product_form_terms,
+                *use_context_terms,
+            ],
+            limit=80,
+        ),
+        "external_identity_sources": [],
+    }
+    composition_lane = composition_lane or {
+        "principal_ingredient_terms": principal_ingredient_terms,
+        "ingredient_taxonomy_terms": ingredient_taxonomy_terms,
+        "composition_terms": composition_terms,
+        "processing_terms": processing_terms,
+        "processing_state": processing_state,
+        "processing_signals": processing_signals,
+        "raw_material_signals": raw_material_signals,
+        "allergen_notice_terms_excluded": allergen_notice_terms,
+        "allergen_notice_texts_excluded": allergen_notice_texts,
+    }
+    classifier_projection = classifier_projection or {
+        "identity_context": "\n".join(
+            str(x)
+            for x in _compact_list(
+                [
+                    identity_lane.get("translated_product_name"),
+                    identity_lane.get("commercial_identity"),
+                    identity_lane.get("normalized_tariff_description"),
+                    *identity_lane.get("commodity_identity_terms", []),
+                ],
+                limit=30,
+            )
+            if str(x).strip()
+        ),
+        "composition_context": "\n".join(
+            str(x)
+            for x in _compact_list(
+                [
+                    *composition_lane.get("principal_ingredient_terms", []),
+                    *composition_lane.get("ingredient_taxonomy_terms", []),
+                    *composition_lane.get("composition_terms", []),
+                    *composition_lane.get("processing_terms", []),
+                    composition_lane.get("processing_state"),
+                ],
+                limit=80,
+            )
+            if str(x).strip()
+        ),
+        "route_terms": _compact_list([*chapter_routing_terms, *routing_keywords], limit=80),
+        "excluded_context_summary": {
+            "allergen_notice_term_count": len(allergen_notice_terms),
+            "allergen_notice_text_count": len(allergen_notice_texts),
+        },
+    }
+
     return {
         "object_type": "ProductUnderstandingFacts",
         "dto_name": "ProductFacts_dto",
@@ -94,6 +174,9 @@ def ProductFacts_dto(
         "llm_confidence": llm_confidence,
         "needs_review": needs_review,
         "routing_terms": routing_terms,
+        "identity_lane": identity_lane,
+        "composition_lane": composition_lane,
+        "classifier_projection": classifier_projection,
         "unknowns": [u for u in unknowns if u],
         "evidence": evidence,
     }
@@ -202,6 +285,77 @@ def Classify_dto(
         "audit": audit,
         **extra,
     }
+
+
+def _ClassifyStage_dto(
+    *,
+    dto_name: str,
+    created_by: str,
+    created_at: str,
+    classify_stage_id: str,
+    product_id: str,
+    source_product_facts_id: str,
+    source_routing_context_id: str,
+    stage_level: str,
+    stage_order: int,
+    classifier_engine: str,
+    input_dto_refs: dict[str, Any],
+    query_used: dict[str, Any],
+    table_reads: list[dict[str, Any]],
+    decision_axes: list[dict[str, Any]],
+    candidate_reviews: list[dict[str, Any]],
+    retained_candidates: list[dict[str, Any]],
+    rejected_candidates: list[dict[str, Any]],
+    selected_codes: list[str],
+    missing_facts: list[str],
+    audit: dict[str, Any],
+    next_stage: str = "",
+    **extra: Any,
+) -> dict[str, Any]:
+    """Short stage-level classification artifact.
+
+    ClassificationAgent writes one artifact per HS/CN narrowing step.  The
+    selection tool may use embeddings/LLM internally, but the blackboard stores
+    the stage answer as a DTO so later agents/admin views can inspect why a
+    code prefix survived.
+    """
+    return {
+        "object_type": "ClassificationStageResult",
+        "dto_name": dto_name,
+        "created_by": created_by,
+        "created_at": created_at,
+        "classify_stage_id": classify_stage_id,
+        "product_id": product_id,
+        "source_product_facts_id": source_product_facts_id,
+        "source_routing_context_id": source_routing_context_id,
+        "stage_level": stage_level,
+        "stage_order": stage_order,
+        "classifier_engine": classifier_engine,
+        "input_dto_refs": input_dto_refs,
+        "query_used": query_used,
+        "table_reads": table_reads,
+        "decision_axes": decision_axes,
+        "candidate_reviews": candidate_reviews,
+        "retained_candidates": retained_candidates,
+        "rejected_candidates": rejected_candidates,
+        "selected_codes": selected_codes,
+        "missing_facts": missing_facts,
+        "next_stage": next_stage,
+        "audit": audit,
+        **extra,
+    }
+
+
+def HS4Classify_dto(**values: Any) -> dict[str, Any]:
+    return _ClassifyStage_dto(dto_name="HS4Classify_dto", stage_level="hs4", stage_order=1, **values)
+
+
+def HS6Classify_dto(**values: Any) -> dict[str, Any]:
+    return _ClassifyStage_dto(dto_name="HS6Classify_dto", stage_level="hs6", stage_order=2, **values)
+
+
+def CN8Classify_dto(**values: Any) -> dict[str, Any]:
+    return _ClassifyStage_dto(dto_name="CN8Classify_dto", stage_level="cn8", stage_order=3, **values)
 
 
 def CodeSet_dto(**values: Any) -> dict[str, Any]:

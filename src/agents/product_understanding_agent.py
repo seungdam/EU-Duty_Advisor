@@ -32,6 +32,10 @@ _ENABLE_PRODUCT_UNDERSTANDING_LLM = (
     os.environ.get("ASAP_ENABLE_PRODUCT_UNDERSTANDING_LLM", "1").strip().lower()
     not in {"0", "false", "no", "off"}
 )
+_ENABLE_ENCYCLOPEDIA_LOOKUP = (
+    os.environ.get("ASAP_ENABLE_ENCYCLOPEDIA_LOOKUP", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
 _TRANSLATION_SYSTEM_PROMPT = (
     "You are a customs tariff classification assistant. Convert a Korean "
     "food/cosmetic product into ONE concise English sentence phrased in HS/CN "
@@ -44,6 +48,7 @@ _TRANSLATION_SYSTEM_PROMPT = (
 )
 _translation_adapter_cache: list = []
 _ontology_context_cache: list[str] = []
+_last_product_understanding_trace: dict[str, Any] = {}
 
 _ONTOLOGY_CONTEXT_FILES = [
     "stage_contract/Product_Understanding.md",
@@ -102,6 +107,22 @@ Ontology routing summary:
 - Prepared foods must not route only by raw ingredient/allergen mentions.
 - Baseline/pre-TARIC document lookup uses RoutingContext after chapter routing.
 """.strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _set_product_understanding_trace(payload: dict[str, Any]) -> None:
+    _last_product_understanding_trace.clear()
+    _last_product_understanding_trace.update(payload)
+
+
+def _product_understanding_trace() -> dict[str, Any]:
+    return dict(_last_product_understanding_trace)
 
 
 def _translation_adapter():
@@ -326,6 +347,11 @@ def build_product_understanding_dto(
 ) -> tuple[dict[str, Any], str]:
     """Return (dto, error). Empty dto means fallback should be used."""
     if not _ENABLE_PRODUCT_UNDERSTANDING_LLM:
+        _set_product_understanding_trace({
+            "enabled": False,
+            "model": _TRANSLATION_MODEL,
+            "error": "disabled_by_env",
+        })
         return {}, "disabled_by_env"
     from bussiness_logic.bridge.schema import (
         LlmGenerationOptions,
@@ -333,29 +359,61 @@ def build_product_understanding_dto(
         LlmResponseFormat,
     )
 
+    user_prompt = _compact_evidence_for_llm(
+        product_name=product_name,
+        description=description,
+        fact_texts=fact_texts,
+        allergen_notice_texts=allergen_notice_texts,
+    )
+    context_chunks = [_load_ontology_context()]
+    max_tokens = _env_int("ASAP_PRODUCT_UNDERSTANDING_MAX_TOKENS", 1600)
+    _set_product_understanding_trace({
+        "enabled": True,
+        "model": _TRANSLATION_MODEL,
+        "max_tokens": max_tokens,
+        "system_prompt_source": "src/agents/product_understanding_agent.py:_PRODUCT_UNDERSTANDING_SYSTEM_PROMPT",
+        "ontology_context_files": list(_ONTOLOGY_CONTEXT_FILES),
+        "user_prompt": user_prompt,
+        "user_prompt_length": len(user_prompt),
+        "context_chunk_lengths": [len(chunk) for chunk in context_chunks],
+        "parse_ok": False,
+        "fallback_reason": "",
+    })
     request = LlmRequest(
-        user_prompt=_compact_evidence_for_llm(
-            product_name=product_name,
-            description=description,
-            fact_texts=fact_texts,
-            allergen_notice_texts=allergen_notice_texts,
-        ),
+        user_prompt=user_prompt,
         system_prompt=_PRODUCT_UNDERSTANDING_SYSTEM_PROMPT,
-        context_chunks=[_load_ontology_context()],
+        context_chunks=context_chunks,
         # Some local Ollama models emit only "{" in provider JSON mode. Ask for
         # JSON in the prompt but request plain text, then parse ourselves.
         response_format=LlmResponseFormat.TEXT,
-        generation_options=LlmGenerationOptions(temperature=0.0, max_tokens=700),
+        generation_options=LlmGenerationOptions(temperature=0.0, max_tokens=max_tokens),
     )
     try:
         response = _translation_adapter().Generate(request)
         generated = getattr(response, "generatedText", "") or ""
         dto = _extract_json_object(generated)
+        trace = _product_understanding_trace()
+        trace.update({
+            "generated_text": generated,
+            "generated_text_length": len(generated),
+            "parse_ok": bool(dto),
+            "parsed_keys": sorted(dto.keys()) if isinstance(dto, dict) else [],
+        })
         if not dto:
             preview = re.sub(r"\s+", " ", generated.strip())[:300]
+            trace["fallback_reason"] = f"empty_or_invalid_json: {preview}"
+            _set_product_understanding_trace(trace)
             return {}, f"empty_or_invalid_json: {preview}"
+        _set_product_understanding_trace(trace)
         return dto, ""
     except Exception as exc:  # noqa: BLE001 - ProductUnderstanding degrades to rules
+        trace = _product_understanding_trace()
+        trace.update({
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+            "fallback_reason": f"{type(exc).__name__}: {exc}",
+        })
+        _set_product_understanding_trace(trace)
         return {}, f"{type(exc).__name__}: {exc}"
 
 
@@ -399,7 +457,7 @@ PROCESSED_SIGNAL_PATTERNS: list[tuple[str, str]] = [
     ("fried", r"튀김|볶음|유탕|fried|stir[- ]?fried|roasted"),
     ("seasoned", r"양념|소스|시즈닝|seasoned|sauce|marinated"),
     ("instant", r"즉석|인스턴트|라면|ramen|instant"),
-    ("soup_or_stew", r"국|탕|찌개|스프|soup|stew|broth"),
+    ("soup_or_stew", r"(?<!중)국|탕|찌개|스프|soup|stew|broth"),
     ("frozen_prepared", r"냉동.*(조제|가공|볶음|튀김)|frozen.*(prepared|cooked)"),
 ]
 
@@ -498,6 +556,116 @@ def _extract_terms(text: str) -> list[str]:
             continue
         terms.append(term)
     return _dedupe(terms, limit=160)
+
+
+def _clean_encyclopedia_query(value: str) -> str:
+    text = re.sub(r"\[[^\]]+\]", " ", str(value or ""))
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:g|kg|ml|l|개입|팩|종|인분)\b", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:택\s*1|택1|냉동|냉장|상온|간편|프리미엄)\b", " ", text, flags=re.I)
+    return re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip(" -_/|")
+
+
+def _encyclopedia_query_candidates(*values: str) -> list[str]:
+    candidates: list[str] = []
+    for raw in values:
+        cleaned = _clean_encyclopedia_query(raw)
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+        compact = re.sub(r"\s+", "", cleaned)
+        # Keep only product-level head nouns. Do not fall back to generic
+        # preparation suffixes such as "볶음" or "구이"; those are dictionary
+        # words but not commodity identities and they pollute routing.
+        if re.search(r"[가-힣]", compact) and 2 <= len(compact) <= 16 and compact not in candidates:
+            candidates.append(compact)
+    return candidates[:8]
+
+
+def _lookup_encyclopedia_identity(queries: list[str]) -> dict[str, Any]:
+    if not _ENABLE_ENCYCLOPEDIA_LOOKUP or not queries:
+        return {
+            "enabled": _ENABLE_ENCYCLOPEDIA_LOOKUP,
+            "configured": False,
+            "found": False,
+            "usable_for_routing": False,
+            "quality_status": "disabled" if not _ENABLE_ENCYCLOPEDIA_LOOKUP else "no_query",
+            "quality_reasons": ["disabled"] if not _ENABLE_ENCYCLOPEDIA_LOOKUP else ["empty_query"],
+            "query": "",
+            "query_candidates": queries,
+            "title": "",
+            "description": "",
+            "link": "",
+            "source": "naver_encyc",
+            "content_hash": "",
+            "error": "disabled" if not _ENABLE_ENCYCLOPEDIA_LOOKUP else "",
+        }
+    try:
+        from agents.tools.encyclopedia_lookup import lookup_first
+
+        result = lookup_first(queries, display=5, timeout=10.0)
+        payload = result.as_dict()
+        payload["enabled"] = True
+        payload["query_candidates"] = queries
+        return payload
+    except Exception as exc:  # noqa: BLE001 - this tool must not break ProductUnderstanding
+        return {
+            "enabled": True,
+            "configured": False,
+            "found": False,
+            "usable_for_routing": False,
+            "quality_status": "error",
+            "quality_reasons": ["lookup_exception"],
+            "query": queries[0] if queries else "",
+            "query_candidates": queries,
+            "title": "",
+            "description": "",
+            "link": "",
+            "source": "naver_encyc",
+            "content_hash": "",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _distill_encyclopedia_identity(
+    *,
+    product_name: str,
+    translated_product_name: str,
+    encyclopedia_identity: dict[str, Any],
+) -> dict[str, Any]:
+    """Return compact identity fields distilled from raw Naver evidence.
+
+    The returned object is allowed to enter routing DTO fields. Raw Naver
+    entries remain evidence only.
+    """
+    entries = encyclopedia_identity.get("entries") or []
+    try:
+        from agents.tools.identity_distiller import IdentityDistillerTool
+
+        return IdentityDistillerTool().distill(
+            product_name=product_name,
+            product_name_en=translated_product_name,
+            entries=entries if isinstance(entries, list) else [],
+        )
+    except Exception as exc:  # noqa: BLE001 - ProductUnderstanding must degrade gracefully
+        return {
+            "configured": False,
+            "succeeded": False,
+            "provider": "gemini",
+            "model": "",
+            "prompt_version": "",
+            "ingredient_class": "other",
+            "food_form": "other",
+            "processing_state": "unknown",
+            "normalized_tariff_description": "",
+            "source_used": "name_only",
+            "confidence": 0.0,
+            "identity_terms": [],
+            "composition_terms": [],
+            "processing_terms": [],
+            "needs_review": True,
+            "conflict_reason": "",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _allergen_term_count(text: str) -> int:
@@ -746,6 +914,169 @@ class ProductUnderstandingAgent(BaseAgent):
         dto_routing_terms = [
             term for term in dto_routing_terms if term.lower() not in excluded_term_values
         ]
+        encyclopedia_queries = _encyclopedia_query_candidates(
+            product_name,
+            translated_product_name,
+            commercial_identity,
+        )
+        encyclopedia_identity = _lookup_encyclopedia_identity(encyclopedia_queries)
+        distilled_identity = _distill_encyclopedia_identity(
+            product_name=product_name,
+            translated_product_name=translated_product_name,
+            encyclopedia_identity=encyclopedia_identity,
+        )
+        encyclopedia_usable = bool(distilled_identity.get("succeeded")) and bool(
+            distilled_identity.get("normalized_tariff_description")
+        )
+        lexical_grounding = dict(distilled_identity)
+        lexical_identity_terms = _list_strings(distilled_identity.get("identity_terms"), limit=20)
+        lexical_composition_terms = _list_strings(distilled_identity.get("composition_terms"), limit=20)
+        lexical_processing_terms = _list_strings(distilled_identity.get("processing_terms"), limit=20)
+        lexical_definition = str(distilled_identity.get("normalized_tariff_description") or "").strip()
+        encyclopedia_term_text = " ".join(
+            _dedupe(
+                [
+                    str(distilled_identity.get("ingredient_class") or ""),
+                    str(distilled_identity.get("food_form") or ""),
+                    str(distilled_identity.get("processing_state") or ""),
+                    lexical_definition,
+                    *lexical_identity_terms,
+                    *lexical_composition_terms,
+                    *lexical_processing_terms,
+                ],
+                limit=60,
+            )
+        ) if encyclopedia_usable else ""
+        encyclopedia_terms = _extract_terms(encyclopedia_term_text)[:60]
+        if encyclopedia_usable:
+            self.cite(
+                "naver_encyc",
+                str(encyclopedia_identity.get("title") or encyclopedia_identity.get("query") or ""),
+                snippet=str(encyclopedia_identity.get("description") or "")[:200],
+                reason="Raw encyclopedia evidence used by IdentityDistillerTool.",
+            )
+            self.cite(
+                "identity_distiller",
+                str(distilled_identity.get("prompt_version") or "identity_distiller"),
+                snippet=lexical_definition[:200],
+                reason="Gemini-distilled compact identity used for ProductFacts_dto routing fields.",
+            )
+            dto_routing_keywords = _dedupe(
+                [*encyclopedia_terms, *dto_routing_keywords],
+                limit=80,
+            )
+            dto_chapter_routing_terms = _dedupe(
+                [*encyclopedia_terms[:30], *dto_chapter_routing_terms],
+                limit=80,
+            )
+            dto_routing_terms = _dedupe(
+                [*encyclopedia_terms, *dto_routing_terms],
+                limit=140,
+            )
+        elif encyclopedia_identity.get("found"):
+            self.reason(
+                "Encyclopedia identity evidence fetched but distillation did not produce routing identity: "
+                + str(distilled_identity.get("error") or distilled_identity.get("conflict_reason") or "")
+            )
+        elif encyclopedia_identity.get("error"):
+            self.reason(f"Encyclopedia identity lookup skipped/failed: {encyclopedia_identity.get('error')}")
+
+        identity_lane = {
+            "raw_product_name": product_name,
+            "short_description": description,
+            "cleaned_head_noun_candidates": encyclopedia_queries,
+            "translated_product_name": translated_product_name[:500],
+            "commercial_identity": commercial_identity[:800],
+            "normalized_tariff_description": normalized_tariff_description[:2000],
+            "product_form_terms": dto_product_form_terms,
+            "commodity_identity_terms": _dedupe(
+                [
+                    translated_product_name,
+                    commercial_identity,
+                    normalized_tariff_description,
+                    *dto_product_form_terms,
+                    *dto_use_context_terms,
+                    *encyclopedia_terms,
+                    *lexical_identity_terms,
+                ],
+                limit=100,
+            ),
+            "distilled_identity": distilled_identity,
+            "lexical_groundings": [distilled_identity] if distilled_identity else [],
+            "external_identity_sources": [
+                {
+                    "source": "naver_encyc",
+                    "enabled": bool(encyclopedia_identity.get("enabled")),
+                    "configured": bool(encyclopedia_identity.get("configured")),
+                    "found": bool(encyclopedia_identity.get("found")),
+                    "usable_for_routing": False,
+                    "quality_status": encyclopedia_identity.get("quality_status") or "",
+                    "quality_reasons": encyclopedia_identity.get("quality_reasons") or [],
+                    "query": encyclopedia_identity.get("query") or "",
+                    "query_candidates": encyclopedia_identity.get("query_candidates") or [],
+                    "entry_count": len(encyclopedia_identity.get("entries") or []),
+                    "content_hash": encyclopedia_identity.get("content_hash") or "",
+                    "entry_digest": distilled_identity.get("entry_digest") or "",
+                    "error": encyclopedia_identity.get("error") or "",
+                }
+            ],
+        }
+        composition_lane = {
+            "raw_ocr_fact_text_count": len(fact_texts),
+            "principal_ingredient_terms": _dedupe(
+                [*dto_principal_terms, *lexical_composition_terms],
+                limit=60,
+            ),
+            "ingredient_taxonomy_terms": dto_ingredient_taxonomy_terms,
+            "composition_terms": _dedupe(
+                [*dto_composition_terms, *lexical_composition_terms],
+                limit=80,
+            ),
+            "processing_terms": _dedupe(
+                [*dto_processing_terms, *lexical_processing_terms],
+                limit=60,
+            ),
+            "processing_state": processing_state,
+            "processing_signals": processing_signals,
+            "raw_material_signals": raw_signals,
+            "allergen_notice_terms_excluded": allergen_notice_terms,
+            "allergen_notice_texts_excluded": allergen_notice_texts,
+        }
+        classifier_projection = {
+            "identity_context": "\n".join(
+                x
+                for x in [
+                    translated_product_name,
+                    commercial_identity,
+                    normalized_tariff_description,
+                    lexical_definition,
+                    " ".join(lexical_identity_terms),
+                ]
+                if str(x).strip()
+            )[:2500],
+            "composition_context": "\n".join(
+                _dedupe(
+                    [
+                        *dto_principal_terms,
+                        *dto_ingredient_taxonomy_terms,
+                        *dto_composition_terms,
+                        *dto_processing_terms,
+                        *lexical_composition_terms,
+                        *lexical_processing_terms,
+                        processing_state,
+                    ],
+                    limit=100,
+                )
+            )[:2500],
+            "route_terms": _dedupe(
+                [*dto_chapter_routing_terms, *dto_routing_keywords],
+                limit=100,
+            ),
+            "excluded_context_summary": {
+                "allergen_notice_text_count": len(allergen_notice_texts),
+                "allergen_notice_terms": allergen_notice_terms[:40],
+            },
+        }
 
         understanding_id = store.next_id("pu")
         out = dto.ProductFacts_dto(
@@ -767,16 +1098,22 @@ class ProductUnderstandingAgent(BaseAgent):
                 "routing_keywords": dto_routing_keywords,
                 "product_form_terms": dto_product_form_terms,
                 "processing_terms": dto_processing_terms,
-                "principal_ingredient_terms": dto_principal_terms,
+                "principal_ingredient_terms": _dedupe(
+                    [*dto_principal_terms, *lexical_composition_terms],
+                    limit=60,
+                ),
                 "ingredient_taxonomy_terms": dto_ingredient_taxonomy_terms,
-                "composition_terms": dto_composition_terms,
+                "composition_terms": _dedupe(
+                    [*dto_composition_terms, *lexical_composition_terms],
+                    limit=80,
+                ),
                 "use_context_terms": dto_use_context_terms,
             },
             product_form_terms=dto_product_form_terms,
-            processing_terms=dto_processing_terms,
-            principal_ingredient_terms=dto_principal_terms,
+            processing_terms=_dedupe([*dto_processing_terms, *lexical_processing_terms], limit=60),
+            principal_ingredient_terms=_dedupe([*dto_principal_terms, *lexical_composition_terms], limit=60),
             ingredient_taxonomy_terms=dto_ingredient_taxonomy_terms,
-            composition_terms=dto_composition_terms,
+            composition_terms=_dedupe([*dto_composition_terms, *lexical_composition_terms], limit=80),
             use_context_terms=dto_use_context_terms,
             chapter_routing_terms=dto_chapter_routing_terms,
             routing_keywords=dto_routing_keywords,
@@ -800,11 +1137,32 @@ class ProductUnderstandingAgent(BaseAgent):
                 "processing_state" if processing_state == "unknown" else "",
                 "primary_ingredient_ratio",
             ],
+            identity_lane=identity_lane,
+            composition_lane=composition_lane,
+            classifier_projection=classifier_projection,
             evidence={
                 "fact_text_count": len(fact_texts),
                 "allergen_notice_text_count": len(allergen_notice_texts),
                 "has_ocr_text": bool(obs.get("ocr_text")),
+                "encyclopedia_lookup": {
+                    "source": "naver_encyc",
+                    "enabled": bool(encyclopedia_identity.get("enabled")),
+                    "configured": bool(encyclopedia_identity.get("configured")),
+                    "found": bool(encyclopedia_identity.get("found")),
+                    "usable_for_routing": False,
+                    "quality_status": encyclopedia_identity.get("quality_status") or "",
+                    "quality_reasons": encyclopedia_identity.get("quality_reasons") or [],
+                    "query": encyclopedia_identity.get("query") or "",
+                    "query_candidates": encyclopedia_identity.get("query_candidates") or [],
+                    "title": encyclopedia_identity.get("title") or "",
+                    "description": encyclopedia_identity.get("description") or "",
+                    "raw_entries": encyclopedia_identity.get("entries") or [],
+                    "content_hash": encyclopedia_identity.get("content_hash") or "",
+                    "error": encyclopedia_identity.get("error") or "",
+                },
+                "identity_distillation": distilled_identity,
                 "llm_raw_understanding": raw_llm_understanding,
+                "llm_understanding_trace": _product_understanding_trace(),
                 "llm_raw_understanding_usage": "audit_only_not_routing_input",
                 "sanitized_for_routing_fields": [
                     "translated_product_name",

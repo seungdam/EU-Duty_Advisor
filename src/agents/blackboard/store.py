@@ -46,6 +46,7 @@ OBJECT_KEY: dict[str, str] = {
     "ProductEvidenceState": "product_evidence_state",
     "ProductUnderstandingFacts": "product_understanding",
     "RoutingContext": "routing_context",
+    "ClassificationStageResult": "classification_stage_results",
     "CandidateCodeSet": "candidate_code_sets",
     # Legacy draft object names retained for old run inspection only. Current
     # agents should fold this context into CandidateCodeSet / DocumentPackage.
@@ -64,7 +65,7 @@ AGENT_WRITE_KEYS: dict[str, set[str]] = {
     "Evidence_Intake_Agent": {"product_evidence_state", "user_questions"},
     "Product_Understanding_Agent": {"product_understanding", "user_questions"},
     "Domain_Router_Agent": {"routing_context", "user_questions"},
-    "Classification_Agent": {"candidate_code_sets", "challenge_responses", "user_questions"},
+    "Classification_Agent": {"classification_stage_results", "candidate_code_sets", "challenge_responses", "user_questions"},
     "Document_Agent": {"document_packages", "challenges", "user_questions"},
     "Orchestrator_Agent": {"orchestrator_decisions", "user_questions"},
 }
@@ -149,6 +150,7 @@ class BlackboardStore:
             },
             "product_understanding": None,
             "routing_context": None,
+            "classification_stage_results": [],
             "candidate_code_sets": [],
             "taric_measure_contexts": [],
             "document_packages": [],

@@ -109,8 +109,10 @@ _KEYWORD_TO_DOMAIN: list[tuple[re.Pattern, list[str]]] = [
 # final CN rule; they give DomainRouter useful top-chapter hints when official
 # chapter keywords are English-only but evidence is Korean OCR text.
 _PRODUCT_FORM_TO_CHAPTER: list[tuple[re.Pattern, str, str]] = [
+    (re.compile(r"\b(stir[- ]?fried|fried|cooked|seasoned|prepared)\b.{0,40}\b(octopus|squid|mollusc|cockle|shrimp|prawn|crustacean|fish|seafood)\b|\b(octopus|squid|mollusc|cockle|shrimp|prawn|crustacean|fish|seafood)\b.{0,40}\b(stir[- ]?fried|fried|cooked|seasoned|prepared)\b|낙지.{0,12}볶음|주꾸미.{0,12}볶음|쭈꾸미.{0,12}볶음|오징어.{0,12}볶음|새우.{0,12}볶음|꼬막.{0,12}(장|무침|볶음)", re.I),
+     "16", "prepared aquatic animal product"),
     (re.compile(r"\b(noodle|ramen|pasta|macaroni|spaghetti)\b|라면|유탕면|국수|면류|파스타"), "19", "cereal/noodle preparation"),
-    (re.compile(r"\b(sauce|seasoning|condiment|soup|broth|stock)\b|소스|양념|조미|스프|미역국|국물|탕|찌개|육수"), "21", "miscellaneous edible preparation"),
+    (re.compile(r"\b(sauce|seasoning|condiment|soup|broth|stock)\b|소스|양념|조미|스프|미역국|국물|(?<!중)국|탕|찌개|육수"), "21", "miscellaneous edible preparation"),
     (re.compile(r"\b(sausage|ham|surimi)\b|소시지|햄|어묵|맛살|멘보샤"), "16", "meat/fish/crustacean preparation"),
     (re.compile(r"\b(dumpling|mandu|stuffed pasta|stuffed noodles)\b|만두|물만두|군만두"), "19", "stuffed pasta/cereal preparation"),
     (re.compile(r"\b(jam|pickle|fruit preparation|vegetable preparation)\b|잼|절임|피클|과실가공|채소가공"), "20", "vegetable/fruit preparation"),
@@ -386,12 +388,36 @@ class DomainRouterTool:
         guardrail evidence, especially raw-vs-prepared food redirects.
         """
         product_facts = product_facts or {}
+        identity_lane = (
+            product_understanding.get("identity_lane")
+            if isinstance(product_understanding.get("identity_lane"), dict)
+            else {}
+        )
+        composition_lane = (
+            product_understanding.get("composition_lane")
+            if isinstance(product_understanding.get("composition_lane"), dict)
+            else {}
+        )
+        classifier_projection = (
+            product_understanding.get("classifier_projection")
+            if isinstance(product_understanding.get("classifier_projection"), dict)
+            else {}
+        )
         # Only the structured ProductUnderstanding description is safe for
         # chapter routing. The legacy one-sentence translation is kept for
         # CN retriever compatibility, but it can hallucinate tariff terms like
         # "stuffed" and must not become chapter evidence.
-        normalized_description = product_understanding.get("normalized_tariff_description") or ""
+        normalized_description = (
+            identity_lane.get("normalized_tariff_description")
+            or product_understanding.get("normalized_tariff_description")
+            or ""
+        )
         keyword_map = product_understanding.get("keyword_map") or {}
+        distilled_identity = (
+            identity_lane.get("distilled_identity")
+            if isinstance(identity_lane.get("distilled_identity"), dict)
+            else {}
+        )
         excluded_terms = {
             str(item.get("term") or "").strip().lower()
             for item in (
@@ -401,8 +427,31 @@ class DomainRouterTool:
             if isinstance(item, dict) and str(item.get("term") or "").strip()
         }
         structured_terms = self._flatten_string_values({
-            "translated_product_name": product_understanding.get("translated_product_name") or "",
-            "commercial_identity": product_understanding.get("commercial_identity") or "",
+            "translated_product_name": identity_lane.get("translated_product_name") or product_understanding.get("translated_product_name") or "",
+            "commercial_identity": identity_lane.get("commercial_identity") or product_understanding.get("commercial_identity") or "",
+            # Never flatten the whole identity_lane. It may contain raw
+            # encyclopedia/OCR evidence for audit. DomainRouter may only read
+            # compact ProductUnderstanding outputs.
+            "distilled_identity": {
+                "ingredient_class": distilled_identity.get("ingredient_class") or "",
+                "food_form": distilled_identity.get("food_form") or "",
+                "processing_state": distilled_identity.get("processing_state") or "",
+                "normalized_tariff_description": distilled_identity.get("normalized_tariff_description") or "",
+                "identity_terms": distilled_identity.get("identity_terms") or [],
+                "composition_terms": distilled_identity.get("composition_terms") or [],
+                "processing_terms": distilled_identity.get("processing_terms") or [],
+            },
+            "identity_lane_compact": {
+                "product_form_terms": identity_lane.get("product_form_terms") or [],
+                "commodity_identity_terms": identity_lane.get("commodity_identity_terms") or [],
+            },
+            "composition_lane": {
+                "principal_ingredient_terms": composition_lane.get("principal_ingredient_terms") or [],
+                "ingredient_taxonomy_terms": composition_lane.get("ingredient_taxonomy_terms") or [],
+                "composition_terms": composition_lane.get("composition_terms") or [],
+                "processing_terms": composition_lane.get("processing_terms") or [],
+            },
+            "classifier_route_terms": classifier_projection.get("route_terms") or [],
             "keyword_map": keyword_map,
             "chapter_routing_terms": product_understanding.get("chapter_routing_terms") or [],
             "routing_keywords": product_understanding.get("routing_keywords") or [],
@@ -423,9 +472,11 @@ class DomainRouterTool:
             # The LLM translation is useful for the CN retriever, but too
             # noisy for chapter routing: it can hallucinate tariff phrases
             # like "frozen" or "airtight containers" from OCR context.
-            product_understanding.get("translated_product_name") or "",
-            product_understanding.get("commercial_identity") or "",
+            identity_lane.get("translated_product_name") or product_understanding.get("translated_product_name") or "",
+            identity_lane.get("commercial_identity") or product_understanding.get("commercial_identity") or "",
             normalized_description,
+            classifier_projection.get("identity_context") or "",
+            classifier_projection.get("composition_context") or "",
             " ".join(structured_terms),
             product_facts.get("product_name") or "",
             product_facts.get("description") or "",
@@ -441,9 +492,23 @@ class DomainRouterTool:
             haystack,
             flags=re.I,
         ) is not None
-        processing_state = product_understanding.get("processing_state") or "unknown"
+        aquatic_prepared_product = (
+            re.search(r"\b(octopus|squid|mollusc|cockle|clam|shrimp|prawn|crustacean|fish|seafood)\b|낙지|주꾸미|쭈꾸미|오징어|꼬막|재첩|새우|대구|고등어|가자미", haystack, flags=re.I)
+            and re.search(r"\b(stir[- ]?fried|fried|cooked|seasoned|prepared|preserved|grilled)\b|볶음|무침|구이|조림|장", haystack, flags=re.I)
+        )
+        soup_or_stew_product = re.search(
+            r"\b(soup|broth|stew)\b|(?<!중)국|탕|찌개|전골|육수",
+            haystack,
+            flags=re.I,
+        ) is not None
+        processing_state = (
+            composition_lane.get("processing_state")
+            or product_understanding.get("processing_state")
+            or "unknown"
+        )
         processed = processing_state == "processed_or_prepared" or bool(
-            product_understanding.get("processing_signals")
+            composition_lane.get("processing_signals")
+            or product_understanding.get("processing_signals")
         )
         domain_hints = set(product_understanding.get("domain_hints") or [])
 
@@ -544,6 +609,13 @@ class DomainRouterTool:
                         "blocking_rule": "sauce_or_condiment_product_should_not_route_by_raw_ingredient_terms",
                     })
                     continue
+            if aquatic_prepared_product:
+                if chapter == "16":
+                    score += 10
+                elif chapter == "21" and not soup_or_stew_product:
+                    score -= 6
+                elif chapter == "19" and not explicit_noodle_product:
+                    score -= 4
 
             if score <= 0:
                 continue

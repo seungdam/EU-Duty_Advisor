@@ -21,9 +21,11 @@ Tools are NOT Agents. They:
 from agents.tools.taric_branch_resolver import TaricBranchResolverTool
 from agents.tools.domain_router import DomainRouterTool
 from agents.tools.document_package_tool import DocumentPackageTool
+from agents.tools.staged_classification import StagedClassificationTool
 
 __all__ = [
     "TaricBranchResolverTool",
     "DomainRouterTool",
     "DocumentPackageTool",
+    "StagedClassificationTool",
 ]
