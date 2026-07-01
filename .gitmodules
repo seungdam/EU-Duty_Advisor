@@ -1,0 +1,3 @@
+[submodule "docs"]
+	path = docs
+	url = https://github.com/12-SNU-Project/ABS-ASAP-Capstone-Docs.git
