@@ -1,28 +1,21 @@
 import { useEffect, useState } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import DocumentPackageDetail from "@/components/DocumentPackageDetail";
 import WorkspaceHeader from "@/components/layout/WorkspaceHeader";
-import { importClassification } from "@/lib/enterpriseApi.js";
 import { getJson } from "@/lib/api.js";
 import { asList, clean } from "@/lib/format.js";
 
 export default function DocumentPage() {
   const { jobId, taric10 } = useParams();
-  const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const caseId = clean(searchParams.get("caseId"));
-  const returnTarget = caseId
-    ? `/enterprise?caseId=${encodeURIComponent(caseId)}&panel=docs`
-    : `/classification?job=${encodeURIComponent(jobId)}`;
+  const returnTarget = `/classification?job=${encodeURIComponent(jobId)}`;
   const [packages, setPackages] = useState([]);
   const [packageData, setPackageData] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const selectedCandidateId = clean(packageData?.candidate_id);
   const selectedCn8 = clean(packageData?.cn8);
   const candidatePackages = selectedCandidateId
@@ -37,29 +30,8 @@ export default function DocumentPage() {
       ? cn8Packages
       : packages;
 
-  const PackagePath = (target) => (
-    `/document/${encodeURIComponent(jobId)}/${encodeURIComponent(target)}${caseId ? `?caseId=${encodeURIComponent(caseId)}` : ""}`
-  );
-
-  const saveToEnterprise = async () => {
-    const selectedTaric10 = clean(packageData?.taric10) || taric10;
-    if (!selectedTaric10 || !window.confirm("선택한 TARIC10과 필요 서류 목록을 수출 상품 관리에 등록하시겠습니까?")) {
-      return;
-    }
-    setSaving(true);
-    setError("");
-    try {
-      const response = await importClassification({ jobId, taric10: selectedTaric10 });
-      if (!response?.caseId) {
-        throw new Error("수출 상품을 등록하지 못했습니다.");
-      }
-      navigate(`/enterprise?caseId=${encodeURIComponent(response.caseId)}&panel=docs`);
-    } catch (saveError) {
-      setError(String(saveError?.message || saveError));
-    } finally {
-      setSaving(false);
-    }
-  };
+  const PackagePath = (target) =>
+    `/document/${encodeURIComponent(jobId)}/${encodeURIComponent(target)}`;
 
   useEffect(() => {
     let cancelled = false;
@@ -102,17 +74,12 @@ export default function DocumentPage() {
   return (
     <div className="grid min-w-0 gap-5">
       <Link className="w-fit text-sm font-semibold text-primary hover:underline" to={returnTarget}>
-        ← {caseId ? "프로젝트 서류 관리" : "품목 분류"}
+        ← 품목 분류
       </Link>
       <WorkspaceHeader
         eyebrow="EU Import Documents"
         title="TARIC 상세 서류 추천"
         description="선택한 TARIC10에 적용될 수 있는 서류와 확인 조건을 검토합니다. 최종 제출 요건은 관할기관 또는 전문가의 확인이 필요합니다."
-        actions={!caseId ? (
-          <Button type="button" disabled={!packageData || saving} onClick={saveToEnterprise}>
-            {saving ? "등록 중..." : "기업 프로젝트에 추가"}
-          </Button>
-        ) : null}
       />
 
       {visiblePackages.length > 1 ? (

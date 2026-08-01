@@ -8,11 +8,9 @@ import "./styles/introduction.css";
 import "./styles/workbench.css";
 import "./styles/admin.css";
 import "./styles/document.css";
-import "./styles/enterprise.css";
 
 const AdminPage = lazy(() => import("./pages/AdminPage"));
 const DocumentPage = lazy(() => import("./pages/DocumentPage"));
-const EnterprisePage = lazy(() => import("./pages/EnterprisePage"));
 const WorkbenchPage = lazy(() => import("./pages/WorkbenchPage"));
 
 function RouteFallback() {
@@ -31,8 +29,6 @@ function ApplicationLayout() {
           <Route path="/" element={<IntroductionPage />} />
           <Route path="/classification" element={<WorkbenchPage />} />
           <Route path="/admin" element={<AdminPage />} />
-          <Route path="/admin/companies" element={<Navigate to="/enterprise" replace />} />
-          <Route path="/enterprise" element={<EnterprisePage />} />
           <Route path="/document/:jobId/:taric10" element={<DocumentPage />} />
           <Route path="*" element={<Navigate to="/classification" replace />} />
         </Routes>

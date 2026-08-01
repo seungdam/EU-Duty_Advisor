@@ -127,18 +127,6 @@ export function BuildDocumentPackageOptions(packagesByTaric, candidate) {
   return options.filter((option) => option.matchLevel === "taric10");
 }
 
-export function ResolveDocumentPackageSelection(options, currentSelection = {}) {
-  const rows = asList(options);
-  const currentTaric = clean(currentSelection.taric);
-  if (currentSelection.manual && rows.some((option) => option.taric === currentTaric)) {
-    return { taric: currentTaric, manual: true };
-  }
-  const best = ["taric10", "cn8", "hs6", "branch"]
-    .map((level) => rows.find((option) => option.matchLevel === level))
-    .find(Boolean);
-  return { taric: clean(best?.taric), manual: false };
-}
-
 export function useClassificationViewModel(result) {
   return useMemo(() => {
     const candidateSet = asObject(result?.candidate_code_set);
