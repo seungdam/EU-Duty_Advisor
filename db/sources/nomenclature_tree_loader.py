@@ -9,7 +9,7 @@
   Indent = dash 문자열 → 트리 깊이의 유일한 진실
   End date 채워진 행 = 만료 코드 (기본 제외)
 
-산출 (DB/artifacts/):
+산출 (db/artifacts/):
   nomenclature_tree.jsonl — 행당 1노드:
     code10, suffix, depth, description, declarable,
     parent(code10-suffix), ancestor_conditions(중간 헤더 서술 체인),
@@ -17,9 +17,9 @@
   nomenclature_tree_summary.json — 검수 지표
 
 실행:
-  python DB/nomenclature_tree_loader.py                 # 전체
-  python DB/nomenclature_tree_loader.py --chapters 16,19,21
-  python DB/nomenclature_tree_loader.py --verify        # pair_rows 정합 검사
+  python db/nomenclature_tree_loader.py                 # 전체
+  python db/nomenclature_tree_loader.py --chapters 16,19,21
+  python db/nomenclature_tree_loader.py --verify        # pair_rows 정합 검사
 """
 from __future__ import annotations
 

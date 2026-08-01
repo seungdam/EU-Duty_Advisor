@@ -10,7 +10,7 @@
 산출: data/std_name_dictionary.jsonl — {ko, en, hs6, hs10, spec_ko, spec_en}
 런타임 브리지는 이 파일을 로드해 2-gram 역색인을 메모리에 구축한다.
 
-실행: python DB/sources/std_name_dictionary.py [--probe 돼지등갈비]
+실행: python db/sources/std_name_dictionary.py [--probe 돼지등갈비]
 """
 from __future__ import annotations
 

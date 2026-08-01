@@ -4,7 +4,7 @@ from pathlib import Path
 
 _SPEC = spec_from_file_location(
     "migrate_runtime_assets",
-    Path(__file__).resolve().parents[1] / "DB/migrate_runtime_assets.py",
+    Path(__file__).resolve().parents[1] / "db/migrate_runtime_assets.py",
 )
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = module_from_spec(_SPEC)

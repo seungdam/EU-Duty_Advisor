@@ -10,7 +10,7 @@
 선언해둔 자리의 실데이터. 분류 파이프라인과 무접점(요건 단계 전용).
 
 테이블은 drop-and-recreate라 재실행 안전. 실행은 설계자 직접:
-  PYTHONPATH=src python DB/uploaders/load_echa_chem.py
+  PYTHONPATH=src python db/uploaders/load_echa_chem.py
 """
 from __future__ import annotations
 

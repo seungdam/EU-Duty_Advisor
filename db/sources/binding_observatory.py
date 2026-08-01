@@ -9,7 +9,7 @@ verdict)가 남고, 답지와 대조하면 그 판정이 정답 코드를 지지
 오답을 지지했는지가 라벨이 된다. 이 카운트가 binding-v2(자격쌍을
 데이터가 결정)와 3단계(필드 선택 학습)의 훈련 행렬이다.
 
-실행: python DB/sources/binding_observatory.py
+실행: python db/sources/binding_observatory.py
 산출: data/binding_observation.jsonl (런 스탬프별 append)
 """
 from __future__ import annotations

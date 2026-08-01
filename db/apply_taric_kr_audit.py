@@ -1,12 +1,12 @@
 """kr_audit_20260714 산출물을 Supabase에 적용하는 원커맨드 스크립트.
 
-  python DB/apply_taric_kr_audit.py --dry-run             # 뭐가 들어갈지 미리보기 (DB 쓰기 없음)
-  python DB/apply_taric_kr_audit.py                       # INSERT 적용 (celex 5 + guidance 27, 중복 자동 스킵)
-  python DB/apply_taric_kr_audit.py --with-scope-update   # + post_master chapter_scope 확장 76건까지
+  python db/apply_taric_kr_audit.py --dry-run             # 뭐가 들어갈지 미리보기 (db 쓰기 없음)
+  python db/apply_taric_kr_audit.py                       # INSERT 적용 (celex 5 + guidance 27, 중복 자동 스킵)
+  python db/apply_taric_kr_audit.py --with-scope-update   # + post_master chapter_scope 확장 76건까지
 
 - 중복 가드: celex는 celex_id, guidance는 certificate_code가 이미 있으면 스킵.
 - 전부 단일 트랜잭션 — 중간 실패 시 통째로 롤백.
-- DB 자격증명은 실행 쉘 환경에서 읽는다 (백엔드 돌리는 그 터미널에서 실행할 것).
+- db 자격증명은 실행 쉘 환경에서 읽는다 (백엔드 돌리는 그 터미널에서 실행할 것).
 """
 from __future__ import annotations
 

@@ -12,7 +12,7 @@
 출력: data/coi_normalized/coi_<slug>.json + index.json + product_map.csv
 
 실행:
-  PYTHONPATH=src python DB/sources/coi_normalize.py \
+  PYTHONPATH=src python db/sources/coi_normalize.py \
       --src "/Users/snu/Downloads/COI(식품원재료풀이)" \
       --answer-csv data/EU_HS_test2.csv
 """

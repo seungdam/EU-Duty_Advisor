@@ -43,7 +43,7 @@ def _empty_form(domain: str, path: Path, status: str = "stub") -> dict:
 
 def ParseFoodCoi(path: Path) -> dict:
     """식품 COI — 구현체는 coi_normalize.NormalizeCoiFile (위임)."""
-    from coi_normalize import NormalizeCoiFile  # DB/sources 동일 디렉토리
+    from coi_normalize import NormalizeCoiFile  # db/sources 동일 디렉토리
     form = NormalizeCoiFile(path)
     form["domain"] = "food"
     return form

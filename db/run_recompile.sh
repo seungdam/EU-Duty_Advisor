@@ -1,13 +1,13 @@
 #!/bin/zsh
-# 술어 테이블 재컴파일 러너 — DB/에서 컴파일 관련 실행을 일원화.
+# 술어 테이블 재컴파일 러너 — db/에서 컴파일 관련 실행을 일원화.
 # 컴파일러 본체는 import 경로 때문에 src/agents/tools/에 남는다.
 #
-# 기본 = Nomenclature 트리 원천 (DB/artifacts/nomenclature_tree.jsonl,
+# 기본 = Nomenclature 트리 원천 (db/artifacts/nomenclature_tree.jsonl,
 #        suffix 80/10·20 명시 계층 — 경로 추측 없음)
 # 사용:
-#   ./DB/run_recompile.sh              # 트리 원천 + apply
-#   ./DB/run_recompile.sh --dry-run    # DB 반영 없이 산출만
-#   ./DB/run_recompile.sh --legacy     # 구 방식(cn_table 경로 + enrich-h6)
+#   ./db/run_recompile.sh              # 트리 원천 + apply
+#   ./db/run_recompile.sh --dry-run    # db 반영 없이 산출만
+#   ./db/run_recompile.sh --legacy     # 구 방식(cn_table 경로 + enrich-h6)
 set -e
 cd "$(dirname "$0")/.."
 

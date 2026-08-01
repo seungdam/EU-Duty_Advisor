@@ -2,14 +2,14 @@
 
 This is the single transition loader retained until the pre-4-table migration
 has been applied and verified. It reads the current local source assets and
-writes idempotent PostgreSQL tables through the shared DB connection.
+writes idempotent PostgreSQL tables through the shared db connection.
 
 The command intentionally does not accept credentials. Run it in the normal
 project runtime where the shared DbSessionManager is already configured.
 
-    PYTHONPATH=src python DB/migrate_runtime_assets.py --plan
-    PYTHONPATH=src python DB/migrate_runtime_assets.py --apply
-    PYTHONPATH=src python DB/migrate_runtime_assets.py --verify
+    PYTHONPATH=src python db/migrate_runtime_assets.py --plan
+    PYTHONPATH=src python db/migrate_runtime_assets.py --apply
+    PYTHONPATH=src python db/migrate_runtime_assets.py --verify
 """
 
 from __future__ import annotations
@@ -29,10 +29,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ASSET_VERSION = "pre4-20260725-v1"
 
 SINGLETON_ASSETS = {
-    "heading_axis_map": PROJECT_ROOT / "DB/artifacts/heading_axis_map.json",
-    "subheading_axis_map": PROJECT_ROOT / "DB/artifacts/subheading_axis_map.json",
-    "bti_recall_index": PROJECT_ROOT / "DB/artifacts/bti_recall_index.json",
-    "heading_vocab": PROJECT_ROOT / "DB/artifacts/heading_vocab.json",
+    "heading_axis_map": PROJECT_ROOT / "db/artifacts/heading_axis_map.json",
+    "subheading_axis_map": PROJECT_ROOT / "db/artifacts/subheading_axis_map.json",
+    "bti_recall_index": PROJECT_ROOT / "db/artifacts/bti_recall_index.json",
+    "heading_vocab": PROJECT_ROOT / "db/artifacts/heading_vocab.json",
     "axis_field_binding": PROJECT_ROOT / "artifacts/binding_v1.json",
     "commodity_taxonomy": PROJECT_ROOT / "data/taxonomy/commodity_taxonomy.json",
     "species_taxonomy": (

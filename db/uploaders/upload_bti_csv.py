@@ -4,12 +4,12 @@
 스키마가 CSV와 조금 달라도 안전하다. 실행은 설계자 직접:
 
   # 1) 소량 스모크 (10행)
-  python DB/upload_bti_csv.py --csv ~/ASAP_A/data/processed/bti_for_upload/bti_case_evidence.csv \
+  python db/upload_bti_csv.py --csv ~/ASAP_A/data/processed/bti_for_upload/bti_case_evidence.csv \
       --table bti_case_evidence --limit 10
 
   # 2) 전체 적재 (기존 행 비우고)
-  python DB/upload_bti_csv.py --csv ... --table bti_case_evidence --truncate
-  python DB/upload_bti_csv.py --csv ~/ASAP_A/data/processed/bti_for_upload/bti_case_full.csv \
+  python db/upload_bti_csv.py --csv ... --table bti_case_evidence --truncate
+  python db/upload_bti_csv.py --csv ~/ASAP_A/data/processed/bti_for_upload/bti_case_full.csv \
       --table <full_테이블명> --truncate
 
 주의: full CSV는 155만 라인(멀티라인 셀 포함, 실제 ~117k 레코드)이라 수 분 걸린다.
@@ -48,7 +48,7 @@ def _normalize(value: object) -> object:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="BTI CSV -> DB 테이블 적재")
+    parser = argparse.ArgumentParser(description="BTI CSV -> db 테이블 적재")
     parser.add_argument("--csv", required=True, help="원본 CSV 경로")
     parser.add_argument("--table", required=True, help="대상 테이블명")
     parser.add_argument("--limit", type=int, default=0, help="N행만 적재 (스모크용, 0=전체)")

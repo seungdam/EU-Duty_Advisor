@@ -10,12 +10,12 @@ chapter/heading/subheading 단위 JSON으로 만든다.
   - 세미콜론/불릿 단위 구문 분해 + 공백 정규화만 수행
   - 판단(어느 구문이 어느 상품에 해당하는가)은 런타임 매칭층의 몫
 
-산출: DB/artifacts/heading_vocab.json
+산출: db/artifacts/heading_vocab.json
   {"chapter": {"16": {"including": [...], "excluding": [...]}, ...},
    "heading": {"1602": {...}, ...},
    "subheading": {"160249": {...}, ...}}
 
-실행: python DB/pair_rows_vocab_harvest.py
+실행: python db/pair_rows_vocab_harvest.py
 """
 from __future__ import annotations
 
