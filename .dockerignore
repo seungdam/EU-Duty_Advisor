@@ -1,0 +1,16 @@
+ .git
+  **/.git
+  .agents/
+  .codex/
+  .idea/
+  .vscode/
+  .env*
+  **/.env*
+  **/__pycache__/
+  **/*.py[cod]
+  .pytest_cache/
+  webapp/node_modules/
+  webapp/dist/
+  artifacts/
+  blackboard.json
+  *.log

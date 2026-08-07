@@ -47,6 +47,7 @@ api_key_env = "EU_EXPORT_OPENAI_KEY"
 
 [embedding]
 enabled = true
+device = "cpu"
 local_files_only = false
 
 [web]

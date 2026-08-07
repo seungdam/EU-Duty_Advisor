@@ -11,12 +11,31 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+import torch
+
 
 ASAP_ROOT = Path(
     os.environ.get("ASAP_PROJECT_ROOT", Path(__file__).resolve().parent),
 ).resolve()
-ASAP_APP_CONFIG_PATH = ASAP_ROOT / ".appconfig.asap_app.toml"
-ASAP_ENV_FILE_PATH = ASAP_ROOT / ".env.asap_app"
+
+
+def _ResolveProjectPath(configuredPath: str | None, defaultPath: Path) -> Path:
+    resolvedPath = (
+        Path(configuredPath).expanduser() if configuredPath else defaultPath
+    )
+    if not resolvedPath.is_absolute():
+        resolvedPath = ASAP_ROOT / resolvedPath
+    return resolvedPath.resolve()
+
+
+ASAP_APP_CONFIG_PATH = _ResolveProjectPath(
+    os.environ.get("ASAP_APP_CONFIG_PATH"),
+    ASAP_ROOT / "config" / ".appconfig.asap_app.toml",
+)
+ASAP_ENV_FILE_PATH = _ResolveProjectPath(
+    os.environ.get("ASAP_ENV_FILE"),
+    ASAP_ROOT / ".env.asap_app",
+)
 os.environ["ASAP_APP_CONFIG_PATH"] = str(ASAP_APP_CONFIG_PATH)
 os.environ["ASAP_ENV_FILE"] = str(ASAP_ENV_FILE_PATH)
 

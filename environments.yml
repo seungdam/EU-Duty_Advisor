@@ -8,8 +8,10 @@ dependencies:
   - python=3.12
   - pip
   - flask
+  - gunicorn
   - numpy
   - pandas
+  - pytorch-cpu=2.13.0
   - pydantic
   - pyyaml
   - rapidfuzz
@@ -32,4 +34,3 @@ dependencies:
 
       # Semantic CN candidate retrieval
       - sentence-transformers
-      - torch
