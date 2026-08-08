@@ -51,7 +51,6 @@ class LlmProfileName(str, Enum):
     INPUT_RECONSTRUCTION_CLAUDE = "input_reconstruction_claude"
     IDENTITY_HINT = "identity_hint"
     HS2_ROUTER = "hs2_router"
-    CLASSIFICATION_SELECTOR = "classification_selector"
     CLASSIFICATION_VALIDATOR = "classification_validator"
     CN_PREDICATE_COMPILER = "cn_predicate_compiler"
 
@@ -192,6 +191,8 @@ class KurlySmokeAppConfig(BaseModel):
     use_structured_ocr: StrictBool = True
     structured_ocr_provider: StrictStr = "paddleocr_vl"
     max_ocr_image_count: StrictInt = 8
+    download_workers: StrictInt = 4
+    max_queued_downloads: StrictInt = 4
     structured_ocr_max_tile_height_pixels: StrictInt = 2400
     structured_ocr_max_tile_side_pixels: StrictInt = 4000
     structured_ocr_tile_overlap_pixels: StrictInt = 240
@@ -247,6 +248,20 @@ class KurlySmokeAppConfig(BaseModel):
     def ValidateMaxOcrImageCount(cls, value: int) -> int:
         if value < 0:
             raise ValueError("max_ocr_image_count must be non-negative.")
+        return value
+
+    @field_validator("download_workers")
+    @classmethod
+    def ValidateDownloadWorkers(cls, value: int) -> int:
+        if not 1 <= value <= 16:
+            raise ValueError("download_workers must be between 1 and 16.")
+        return value
+
+    @field_validator("max_queued_downloads")
+    @classmethod
+    def ValidateMaxQueuedDownloads(cls, value: int) -> int:
+        if not 0 <= value <= 64:
+            raise ValueError("max_queued_downloads must be between 0 and 64.")
         return value
 
     def BuildStructuredOcrVlExtraOptions(self) -> dict[str, str]:
@@ -338,6 +353,31 @@ class ClassificationAppConfig(BaseModel):
         return value
 
 
+class PipelineExecutionAppConfig(BaseModel):
+    """단일 web process 내부 pipeline run 실행 한도."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    max_workers: StrictInt = 2
+    max_queued_runs: StrictInt = 2
+
+    @field_validator("max_workers")
+    @classmethod
+    def ValidateMaxWorkers(cls, value: int) -> int:
+        if not 1 <= value <= 8:
+            raise ValueError("pipeline_execution max_workers must be between 1 and 8.")
+        return value
+
+    @field_validator("max_queued_runs")
+    @classmethod
+    def ValidateMaxQueuedRuns(cls, value: int) -> int:
+        if not 0 <= value <= 64:
+            raise ValueError(
+                "pipeline_execution max_queued_runs must be between 0 and 64."
+            )
+        return value
+
+
 class WebAppConfig(BaseModel):
     """React webapp와 pipeline backend 실행 경계 설정."""
 
@@ -383,6 +423,9 @@ class AppConfig(BaseModel):
     paths: AppPathsConfig = Field(default_factory=AppPathsConfig)
     classification: ClassificationAppConfig = Field(
         default_factory=ClassificationAppConfig,
+    )
+    pipeline_execution: PipelineExecutionAppConfig = Field(
+        default_factory=PipelineExecutionAppConfig,
     )
     web: WebAppConfig = Field(default_factory=WebAppConfig)
     kurly_smoke: KurlySmokeAppConfig = Field(default_factory=KurlySmokeAppConfig)

@@ -12,6 +12,9 @@ from bussiness_logic.pipeline.run_paths import APP_CONFIG, PROJECT_ROOT
 from bussiness_logic.product.ocr.ocr_execution import (
     SHARED_OCR_EXECUTION_COORDINATOR,
 )
+from bussiness_logic.product.ocr.download_execution import (
+    DownloadExecutionCoordinator,
+)
 from bussiness_logic.utils.json_types import JsonObject
 
 if TYPE_CHECKING:
@@ -40,6 +43,8 @@ PRODUCT_INPUT_ARTIFACT_ROOT = APP_CONFIG.paths.ResolvePath(
     PROJECT_ROOT,
     APP_CONFIG.paths.product_input_artifact_root,
 )
+
+
 @lru_cache(maxsize=1)
 def _BuildKurlyOcrEngines() -> tuple[object, object | None]:
     """프로세스 수명 동안 무거운 Paddle OCR 모델을 재사용한다."""
@@ -72,6 +77,15 @@ def _BuildKurlyOcrEngines() -> tuple[object, object | None]:
             ),
         ),
         PaddleOcrEngine(),
+    )
+
+
+@lru_cache(maxsize=1)
+def _BuildKurlyDownloadCoordinator() -> DownloadExecutionCoordinator:
+    smokeConfig = APP_CONFIG.kurly_smoke
+    return DownloadExecutionCoordinator(
+        maxWorkers=smokeConfig.download_workers,
+        maxQueuedDownloads=smokeConfig.max_queued_downloads,
     )
 
 
@@ -234,6 +248,7 @@ def CollectKurlyUrlFacts(
                 screeningOcrEngine=screening_ocr_engine,
                 inputReconstructionService=input_reconstruction_service,
                 imageStatusCallback=imageStatusCallback,
+                downloadExecutionCoordinator=_BuildKurlyDownloadCoordinator(),
             )
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"ocr_engine_unavailable: {exc}")

@@ -3,6 +3,7 @@
 import json
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -12,6 +13,10 @@ from urllib.request import Request, urlopen
 from pydantic import BaseModel, ConfigDict, Field
 
 from bussiness_logic.artifact_paths import ExtractProductIdFromUrl
+from bussiness_logic.product.ocr.download_execution import (
+    DownloadExecutionCoordinator,
+    SHARED_DOWNLOAD_EXECUTION_COORDINATOR,
+)
 from bussiness_logic.product.ocr.ocr_execution import (
     OcrExecutionCoordinator,
     SHARED_OCR_EXECUTION_COORDINATOR,
@@ -70,6 +75,16 @@ OCR_SCREENING_QUANTITY_PATTERN = re.compile(
 )
 
 OcrImageStatusCallback = Callable[[int, str, str, str, str], None]
+
+
+@dataclass(frozen=True)
+class _DownloadedOcrImage:
+    imageIndex: int
+    imageUrl: str
+    imageBytes: bytes | None
+    artifactPath: Path | None
+    processingTimes: Dict[str, float]
+    error: str | None = None
 
 
 class ProductOcrImageResult(BaseModel):
@@ -391,6 +406,9 @@ class ProductOcrFallbackRunner:
         useStructuredOcrRegionCrop: bool = True,
         enableTableGroundingDiagnostic: bool = False,
         ocrExecutionCoordinator: Optional[OcrExecutionCoordinator] = None,
+        downloadExecutionCoordinator: Optional[
+            DownloadExecutionCoordinator
+        ] = None,
     ) -> None:
         self._ocrEngine = ocrEngine
         self._screeningEngine = screeningEngine
@@ -405,6 +423,9 @@ class ProductOcrFallbackRunner:
         self._enableTableGroundingDiagnostic = enableTableGroundingDiagnostic
         self._ocrExecutionCoordinator = (
             ocrExecutionCoordinator or SHARED_OCR_EXECUTION_COORDINATOR
+        )
+        self._downloadExecutionCoordinator = (
+            downloadExecutionCoordinator or SHARED_DOWNLOAD_EXECUTION_COORDINATOR
         )
 
     def Run(
@@ -423,22 +444,44 @@ class ProductOcrFallbackRunner:
             preserveInputImages=reuseArtifactImages,
         )
 
-        imageResults: List[ProductOcrImageResult] = []
         selectedImageUrls = imageUrls[: max(0, maxImageCount)]
-        for imageIndex, imageUrl in enumerate(selectedImageUrls, start=1):
-            imageResult = self._ExtractImageText(
-                imageIndex=imageIndex,
-                imageUrl=imageUrl,
-                artifactDirectory=artifactDirectory,
-                downloadTimeoutSeconds=downloadTimeoutSeconds,
-                reuseArtifactImages=reuseArtifactImages,
-                imageStatusCallback=imageStatusCallback,
+        downloadFutures = [
+            self._downloadExecutionCoordinator.Submit(
+                lambda imageIndex=imageIndex, imageUrl=imageUrl: self._DownloadImage(
+                    imageIndex=imageIndex,
+                    imageUrl=imageUrl,
+                    artifactDirectory=artifactDirectory,
+                    downloadTimeoutSeconds=downloadTimeoutSeconds,
+                    reuseArtifactImages=reuseArtifactImages,
+                )
+            )
+            for imageIndex, imageUrl in enumerate(selectedImageUrls, start=1)
+        ]
+        downloadedImages = [future.result() for future in downloadFutures]
+
+        imageResults: List[ProductOcrImageResult] = []
+        for downloadedImage in downloadedImages:
+            imageResult = (
+                ProductOcrImageResult(
+                    imageUrl=downloadedImage.imageUrl,
+                    imageIndex=downloadedImage.imageIndex,
+                    processingTimes={
+                        key: round(value, 3)
+                        for key, value in downloadedImage.processingTimes.items()
+                    },
+                    error=downloadedImage.error,
+                )
+                if downloadedImage.error is not None
+                else self._ExtractDownloadedImageText(
+                    downloadedImage=downloadedImage,
+                    imageStatusCallback=imageStatusCallback,
+                )
             )
             imageResults.append(imageResult)
             self._NotifyImageStatus(
                 imageStatusCallback,
-                imageIndex,
-                imageUrl,
+                downloadedImage.imageIndex,
+                downloadedImage.imageUrl,
                 (
                     "failed"
                     if imageResult.error
@@ -475,15 +518,15 @@ class ProductOcrFallbackRunner:
             if imageResult.ocrText
         )
 
-    def _ExtractImageText(
+    def _DownloadImage(
         self,
+        *,
         imageIndex: int,
         imageUrl: str,
         artifactDirectory: Path,
         downloadTimeoutSeconds: int,
         reuseArtifactImages: bool,
-        imageStatusCallback: OcrImageStatusCallback | None,
-    ) -> ProductOcrImageResult:
+    ) -> _DownloadedOcrImage:
         artifactPath: Optional[Path] = None
         processingTimes: Dict[str, float] = {}
         try:
@@ -511,6 +554,41 @@ class ProductOcrFallbackRunner:
             else:
                 artifactPath, imageBytes = reusableImage
                 processingTimes["cached_image_read"] = 0.0
+            return _DownloadedOcrImage(
+                imageIndex=imageIndex,
+                imageUrl=imageUrl,
+                imageBytes=imageBytes,
+                artifactPath=artifactPath,
+                processingTimes=processingTimes,
+            )
+        except Exception as error:
+            return _DownloadedOcrImage(
+                imageIndex=imageIndex,
+                imageUrl=imageUrl,
+                imageBytes=None,
+                artifactPath=None,
+                processingTimes=processingTimes,
+                error="OCR fallback failed for image {0}: {1}".format(
+                    imageUrl,
+                    error,
+                ),
+            )
+
+    def _ExtractDownloadedImageText(
+        self,
+        *,
+        downloadedImage: _DownloadedOcrImage,
+        imageStatusCallback: OcrImageStatusCallback | None,
+    ) -> ProductOcrImageResult:
+        imageIndex = downloadedImage.imageIndex
+        imageUrl = downloadedImage.imageUrl
+        imageBytes = downloadedImage.imageBytes
+        artifactPath = downloadedImage.artifactPath
+        processingTimes = dict(downloadedImage.processingTimes)
+        if imageBytes is None or artifactPath is None:
+            raise ValueError("downloaded image bytes and artifact path are required")
+        artifactDirectory = artifactPath.parent
+        try:
             structuredOcrResult, screeningResult = (
                 self._ocrExecutionCoordinator.Execute(
                     lambda: self._RunOcrEngines(
