@@ -54,6 +54,8 @@ from backend.app import CreateBackendApp
 
 appConfig = LoadAppConfig(ASAP_ROOT)
 app = CreateBackendApp(
+    pipelineRunMaxWorkers=appConfig.pipeline_execution.max_workers,
+    pipelineRunMaxQueuedRuns=appConfig.pipeline_execution.max_queued_runs,
     allowedFrontendOrigins=appConfig.web.allowed_frontend_origins,
     webappDistDir=ASAP_ROOT / "webapp" / "dist",
 )

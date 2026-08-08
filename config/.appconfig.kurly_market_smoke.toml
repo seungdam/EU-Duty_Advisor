@@ -75,6 +75,7 @@ run_ocr_fallback = true
 use_structured_ocr = true
 download_workers = 4
 max_queued_downloads = 4
+max_pending_ocr_images = 4
 structured_ocr_provider = "paddleocr_vl"
 use_input_reconstruction = true
 use_llm_input_reconstruction = true

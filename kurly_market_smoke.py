@@ -39,6 +39,9 @@ from bussiness_logic.product.ocr.ocr_fallback import (  # noqa: E402
     ProductOcrImageDownloader,
     ProductOcrImageResult,
 )
+from bussiness_logic.product.ocr.download_execution import (  # noqa: E402
+    DownloadExecutionCoordinator,
+)
 from bussiness_logic.product.pipeline.kurly_url_intake_pipeline import (  # noqa: E402
     KurlyUrlIntakePipeline,
 )
@@ -905,6 +908,11 @@ class KurlyMarketSmokeRunner:
         self._runOcrFallback = smokeConfig.run_ocr_fallback
         self._useStructuredOcr = smokeConfig.use_structured_ocr
         self._maxOcrImageCount = smokeConfig.max_ocr_image_count
+        self._downloadExecutionCoordinator = DownloadExecutionCoordinator(
+            maxWorkers=smokeConfig.download_workers,
+            maxQueuedDownloads=smokeConfig.max_queued_downloads,
+        )
+        self._maxPendingOcrImages = smokeConfig.max_pending_ocr_images
         self._structuredOcrMaxTileHeightPixels = (
             smokeConfig.structured_ocr_max_tile_height_pixels
         )
@@ -1227,6 +1235,8 @@ class KurlyMarketSmokeRunner:
             ocrEngine=ocrEngine,
             screeningOcrEngine=screeningOcrEngine,
             inputReconstructionService=inputReconstructionService,
+            downloadExecutionCoordinator=self._downloadExecutionCoordinator,
+            maxPendingOcrImages=self._maxPendingOcrImages,
         )
 
     def _BuildInputReconstructionService(self) -> ProductInputReconstructionService | None:
@@ -1445,9 +1455,6 @@ class KurlyMarketSmokeRunner:
                 ),
                 routingRuntimeAdapter=BuildOptionalPipelineRuntimeAdapter(
                     LlmProfileName.HS2_ROUTER,
-                ),
-                selectionRuntimeAdapter=BuildOptionalPipelineRuntimeAdapter(
-                    LlmProfileName.CLASSIFICATION_SELECTOR,
                 ),
                 validationRuntimeAdapter=BuildOptionalPipelineRuntimeAdapter(
                     LlmProfileName.CLASSIFICATION_VALIDATOR,
