@@ -1208,6 +1208,23 @@ class StagedClassificationTool:
                         parents=parents,
                         bti_summons=bti_summons,
                     )
+                    decision_fallback = ""
+                    if not question_options:
+                        decision_fallback = (
+                            "gri3d_question_required"
+                            if level == "hs4"
+                            else "gri6d_question_required"
+                        )
+                        self._append_gri_d_question_details(
+                            ranked,
+                            level=level,
+                        )
+                        question_options = self._question_options(
+                            ranked,
+                            level=level,
+                            parents=parents,
+                            bti_summons=bti_summons,
+                        )
                     stage_trace = self._trace(
                         level,
                         ranked,
@@ -1218,6 +1235,8 @@ class StagedClassificationTool:
                     )
                     stage_trace["selection_authority"] = "none"
                     stage_trace["question_options"] = question_options
+                    if decision_fallback:
+                        stage_trace["decision_fallback"] = decision_fallback
                     stages.append(stage_trace)
                     return self._unresolved_result(
                         level=level,
@@ -2695,6 +2714,8 @@ class StagedClassificationTool:
         """Apply answers to questions added by the post-rank axis stamp."""
         from bussiness_logic.classification.rules.question_contract import (
             ApplyClassificationAnswers,
+            FindClassificationAnswer,
+            NormalizeClassificationAnswer,
         )
 
         for row in ranked:
@@ -2703,7 +2724,31 @@ class StagedClassificationTool:
                 continue
             parent_code = code[:-2]
             context_scope = str(row.get("context_scope") or "")
-            details = row.get("decision_detail") or []
+            details = list(row.get("decision_detail") or [])
+            gri_d_detail = StagedClassificationTool._gri_d_question_detail(
+                row,
+                level=level,
+            )
+            gri_d_key = StagedClassificationTool._question_key_for_detail(
+                row,
+                gri_d_detail,
+                level=level,
+            )
+            gri_d_answer = FindClassificationAnswer(
+                product_facts,
+                questionKey=gri_d_key,
+            )
+            if (
+                gri_d_answer
+                and not any(
+                    str(detail.get("why") or "")
+                    == str(gri_d_detail.get("why") or "")
+                    for detail in details
+                    if isinstance(detail, dict)
+                )
+            ):
+                details.append(gri_d_detail)
+                row["decision_detail"] = details
             if details:
                 row["decision"], row["decision_detail"], _ = (
                     ApplyClassificationAnswers(
@@ -2729,6 +2774,107 @@ class StagedClassificationTool:
                         contextScope=context_scope,
                     )
                 )
+            if gri_d_answer:
+                normalized_answer = NormalizeClassificationAnswer(
+                    gri_d_answer.get("answer"),
+                )
+                if normalized_answer == "yes":
+                    row["decision"] = "confirmed"
+                    if context_scope:
+                        row["context_decision"] = "confirmed"
+                elif normalized_answer == "no":
+                    row["decision"] = "violated"
+
+    @staticmethod
+    def _gri_d_question_detail(
+        row: dict[str, Any],
+        *,
+        level: str,
+    ) -> dict[str, Any]:
+        rule = "gri3d" if level == "hs4" else "gri6d"
+        description = str(row.get("descr") or row.get("code") or "")
+        return {
+            "cond": "classification_branch",
+            "op": "axis_verdict",
+            "verdict": "silent",
+            "field": "",
+            "why": f"{rule}:no_authoritative_selection_or_bti",
+            "value": description,
+            "binding_axis": "classification_branch",
+            "authority": "explicit_user_answer_required",
+        }
+
+    @staticmethod
+    def _question_key_for_detail(
+        row: dict[str, Any],
+        detail: dict[str, Any],
+        *,
+        level: str,
+    ) -> str:
+        from bussiness_logic.classification.rules.question_contract import (
+            BuildClassificationQuestionKey,
+            ResolveQuestionCandidateCode,
+        )
+
+        code = str(row.get("code") or "")
+        parent_code = code[:-2]
+        context_scope = str(row.get("context_scope") or "")
+        candidate_code = ResolveQuestionCandidateCode(
+            detail,
+            parentCode=parent_code,
+            candidateCode=code,
+            contextScope=context_scope,
+        )
+        return BuildClassificationQuestionKey(
+            stage=level,
+            parentCode=parent_code,
+            candidateCode=candidate_code,
+            axis=str(
+                detail.get("binding_axis")
+                or detail.get("axis")
+                or detail.get("cond")
+                or ""
+            ),
+            canonicalField=str(detail.get("field") or ""),
+            conditionValue=detail.get("value"),
+            predicateOp=str(detail.get("op") or "axis_verdict"),
+            contextScope=context_scope,
+        )
+
+    @staticmethod
+    def _append_gri_d_question_details(
+        ranked: list[dict[str, Any]],
+        *,
+        level: str,
+    ) -> int:
+        """Expose a final-stage question when GRI/BTI has no legal winner."""
+        appended = 0
+        review_rows = [
+            row for row in ranked
+            if str(row.get("decision") or "") != "violated"
+            and str(row.get("context_decision") or "") != "violated"
+        ]
+        if not review_rows:
+            review_rows = ranked
+        for row in review_rows:
+            detail = StagedClassificationTool._gri_d_question_detail(
+                row,
+                level=level,
+            )
+            details = [
+                dict(item)
+                for item in (row.get("decision_detail") or [])
+                if isinstance(item, dict)
+            ]
+            if any(
+                str(item.get("why") or "") == str(detail.get("why") or "")
+                for item in details
+            ):
+                continue
+            details.append(detail)
+            row["decision_detail"] = details
+            appended += 1
+        return appended
 
     @staticmethod
     def _consume_context_observation(
@@ -2977,8 +3123,10 @@ class StagedClassificationTool:
             if str(item.get("level") or "") == level
         ]
         for row in ranked:
-            if str(row.get("decision") or "") == "violated":
-                continue
+            automatic_violation = (
+                str(row.get("decision") or "") == "violated"
+                or str(row.get("context_decision") or "") == "violated"
+            )
             decision_details = [
                 dict(item)
                 for item in list(row.get("decision_detail") or [])
@@ -2987,6 +3135,17 @@ class StagedClassificationTool:
                    and str(item.get("verdict") or "").lower()
                    in ("", "unknown", "undecided", "silent")
             ]
+            gri_d_details = [
+                detail
+                for detail in decision_details
+                if str(detail.get("why") or "").startswith(
+                    ("gri3d:", "gri6d:"),
+                )
+            ]
+            if automatic_violation:
+                if not gri_d_details:
+                    continue
+                decision_details = gri_d_details
             predicate_details = [
                 dict(item)
                 for item in list(row.get("predicate_results") or [])
@@ -2995,6 +3154,8 @@ class StagedClassificationTool:
                    and str(item.get("verdict") or "").lower()
                    in ("", "unknown", "undecided", "silent")
             ]
+            if automatic_violation:
+                predicate_details = []
             # The decision table is the primary legal question source.
             # Predicates are a fallback only when no actionable decision-table
             # question exists for this candidate.
