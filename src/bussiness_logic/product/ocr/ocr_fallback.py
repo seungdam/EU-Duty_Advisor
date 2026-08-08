@@ -12,6 +12,10 @@ from urllib.request import Request, urlopen
 from pydantic import BaseModel, ConfigDict, Field
 
 from bussiness_logic.artifact_paths import ExtractProductIdFromUrl
+from bussiness_logic.product.ocr.ocr_execution import (
+    OcrExecutionCoordinator,
+    SHARED_OCR_EXECUTION_COORDINATOR,
+)
 from bussiness_logic.product.ocr.paddle_ocr import (
     BuildOcrRegionCrop,
     BuildTableGroundingDiagnostics,
@@ -386,6 +390,7 @@ class ProductOcrFallbackRunner:
         screeningEngine: Optional[ProductOcrEngine] = None,
         useStructuredOcrRegionCrop: bool = True,
         enableTableGroundingDiagnostic: bool = False,
+        ocrExecutionCoordinator: Optional[OcrExecutionCoordinator] = None,
     ) -> None:
         self._ocrEngine = ocrEngine
         self._screeningEngine = screeningEngine
@@ -398,6 +403,9 @@ class ProductOcrFallbackRunner:
         )
         self._useStructuredOcrRegionCrop = useStructuredOcrRegionCrop
         self._enableTableGroundingDiagnostic = enableTableGroundingDiagnostic
+        self._ocrExecutionCoordinator = (
+            ocrExecutionCoordinator or SHARED_OCR_EXECUTION_COORDINATOR
+        )
 
     def Run(
         self,
@@ -503,87 +511,17 @@ class ProductOcrFallbackRunner:
             else:
                 artifactPath, imageBytes = reusableImage
                 processingTimes["cached_image_read"] = 0.0
-            screeningResult: Optional[ProductStructuredOcrResult] = None
-            screeningRegions: List[ProductOcrTextRegion] = []
-            if self._screeningEngine is not None:
-                try:
-                    startedAt = perf_counter()
-                    screeningResult, screeningRegions = (
-                        self._screeningEngine.ExtractStructuredTextWithRegionsFromImage(
-                            imageBytes,
-                        )
+            structuredOcrResult, screeningResult = (
+                self._ocrExecutionCoordinator.Execute(
+                    lambda: self._RunOcrEngines(
+                        imageBytes=imageBytes,
+                        imageIndex=imageIndex,
+                        imageUrl=imageUrl,
+                        processingTimes=processingTimes,
+                        imageStatusCallback=imageStatusCallback,
                     )
-                    processingTimes["raw_ocr"] = perf_counter() - startedAt
-                except Exception:
-                    screeningResult = None
-
-            shouldRunStructuredOcr, screeningSummary = (
-                self._EvaluateStructuredOcrCandidate(
-                    screeningResult.text if screeningResult is not None else "",
                 )
             )
-            if screeningResult is not None and not shouldRunStructuredOcr:
-                structuredOcrResult = screeningResult.model_copy(
-                    update={
-                        "fallbackReason": None,
-                        "textMergeMode": "screened_raw_only",
-                        "warnings": [
-                            *screeningResult.warnings,
-                            "structured_ocr_skipped_by_screening {0}".format(
-                                screeningSummary,
-                            ),
-                        ],
-                    }
-                )
-            else:
-                structuredInputBytes = imageBytes
-                roiBounds: Optional[Tuple[int, int, int, int]] = None
-                if screeningRegions and self._useStructuredOcrRegionCrop:
-                    startedAt = perf_counter()
-                    regionCrop = BuildOcrRegionCrop(
-                        imageBytes,
-                        screeningRegions,
-                        OCR_SCREENING_STRUCTURED_LABELS,
-                    )
-                    processingTimes["roi_build"] = perf_counter() - startedAt
-                    if regionCrop is not None:
-                        structuredInputBytes, roiBounds = regionCrop
-                self._NotifyImageStatus(
-                    imageStatusCallback,
-                    imageIndex,
-                    imageUrl,
-                    "vlm-processing",
-                    "",
-                    "",
-                )
-                startedAt = perf_counter()
-                structuredOcrResult = (
-                    self._ocrEngine.ExtractStructuredTextFromImage(
-                        structuredInputBytes,
-                    )
-                )
-                processingTimes["structured_ocr"] = perf_counter() - startedAt
-                if screeningResult is not None:
-                    structuredOcrResult = self._MergeStructuredAndScreeningOcr(
-                        structuredOcrResult,
-                        screeningResult,
-                        screeningSummary=screeningSummary,
-                        roiBounds=roiBounds,
-                    )
-            if (
-                self._enableTableGroundingDiagnostic
-                and structuredOcrResult.tableCandidates
-            ):
-                structuredOcrResult = structuredOcrResult.model_copy(
-                    update={
-                        "tableGroundingDiagnostics": (
-                            BuildTableGroundingDiagnostics(
-                                structuredOcrResult.tableCandidates,
-                                screeningRegions,
-                            )
-                        )
-                    }
-                )
             tableEvidenceArtifactPath = self._artifactStore.WriteTableEvidence(
                 artifactDirectory=artifactDirectory,
                 imageIndex=imageIndex,
@@ -617,7 +555,9 @@ class ProductOcrFallbackRunner:
             imageTiles = (
                 [(None, imageBytes)]
                 if screeningResult is not None
-                else self._ocrEngine.BuildArtifactImageTiles(imageBytes)
+                else self._ocrExecutionCoordinator.Execute(
+                    lambda: self._ocrEngine.BuildArtifactImageTiles(imageBytes)
+                )
             )
             artifactPaths = self._artifactStore.ReplaceImageWithInformativeTiles(
                 artifactPath=artifactPath,
@@ -675,6 +615,94 @@ class ProductOcrFallbackRunner:
                     error,
                 ),
             )
+
+    def _RunOcrEngines(
+        self,
+        *,
+        imageBytes: bytes,
+        imageIndex: int,
+        imageUrl: str,
+        processingTimes: Dict[str, float],
+        imageStatusCallback: OcrImageStatusCallback | None,
+    ) -> Tuple[ProductStructuredOcrResult, Optional[ProductStructuredOcrResult]]:
+        screeningResult: Optional[ProductStructuredOcrResult] = None
+        screeningRegions: List[ProductOcrTextRegion] = []
+        if self._screeningEngine is not None:
+            try:
+                startedAt = perf_counter()
+                screeningResult, screeningRegions = (
+                    self._screeningEngine.ExtractStructuredTextWithRegionsFromImage(
+                        imageBytes,
+                    )
+                )
+                processingTimes["raw_ocr"] = perf_counter() - startedAt
+            except Exception:
+                screeningResult = None
+
+        shouldRunStructuredOcr, screeningSummary = (
+            self._EvaluateStructuredOcrCandidate(
+                screeningResult.text if screeningResult is not None else "",
+            )
+        )
+        if screeningResult is not None and not shouldRunStructuredOcr:
+            structuredOcrResult = screeningResult.model_copy(
+                update={
+                    "fallbackReason": None,
+                    "textMergeMode": "screened_raw_only",
+                    "warnings": [
+                        *screeningResult.warnings,
+                        "structured_ocr_skipped_by_screening {0}".format(
+                            screeningSummary,
+                        ),
+                    ],
+                }
+            )
+        else:
+            structuredInputBytes = imageBytes
+            roiBounds: Optional[Tuple[int, int, int, int]] = None
+            if screeningRegions and self._useStructuredOcrRegionCrop:
+                startedAt = perf_counter()
+                regionCrop = BuildOcrRegionCrop(
+                    imageBytes,
+                    screeningRegions,
+                    OCR_SCREENING_STRUCTURED_LABELS,
+                )
+                processingTimes["roi_build"] = perf_counter() - startedAt
+                if regionCrop is not None:
+                    structuredInputBytes, roiBounds = regionCrop
+            self._NotifyImageStatus(
+                imageStatusCallback,
+                imageIndex,
+                imageUrl,
+                "vlm-processing",
+                "",
+                "",
+            )
+            startedAt = perf_counter()
+            structuredOcrResult = self._ocrEngine.ExtractStructuredTextFromImage(
+                structuredInputBytes,
+            )
+            processingTimes["structured_ocr"] = perf_counter() - startedAt
+            if screeningResult is not None:
+                structuredOcrResult = self._MergeStructuredAndScreeningOcr(
+                    structuredOcrResult,
+                    screeningResult,
+                    screeningSummary=screeningSummary,
+                    roiBounds=roiBounds,
+                )
+        if (
+            self._enableTableGroundingDiagnostic
+            and structuredOcrResult.tableCandidates
+        ):
+            structuredOcrResult = structuredOcrResult.model_copy(
+                update={
+                    "tableGroundingDiagnostics": BuildTableGroundingDiagnostics(
+                        structuredOcrResult.tableCandidates,
+                        screeningRegions,
+                    )
+                }
+            )
+        return structuredOcrResult, screeningResult
 
     @staticmethod
     def _NotifyImageStatus(

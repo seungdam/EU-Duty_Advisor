@@ -4,12 +4,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import lru_cache
 import json
-from threading import Lock
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from bussiness_logic.artifact_paths import ExtractProductIdFromUrl
 from bussiness_logic.pipeline.run_paths import APP_CONFIG, PROJECT_ROOT
+from bussiness_logic.product.ocr.ocr_execution import (
+    SHARED_OCR_EXECUTION_COORDINATOR,
+)
 from bussiness_logic.utils.json_types import JsonObject
 
 if TYPE_CHECKING:
@@ -38,9 +40,6 @@ PRODUCT_INPUT_ARTIFACT_ROOT = APP_CONFIG.paths.ResolvePath(
     PROJECT_ROOT,
     APP_CONFIG.paths.product_input_artifact_root,
 )
-_KURLY_OCR_RUNTIME_LOCK = Lock()
-
-
 @lru_cache(maxsize=1)
 def _BuildKurlyOcrEngines() -> tuple[object, object | None]:
     """프로세스 수명 동안 무거운 Paddle OCR 모델을 재사용한다."""
@@ -226,7 +225,9 @@ def CollectKurlyUrlFacts(
 
     if run_ocr:
         try:
-            ocr_engine, screening_ocr_engine = _BuildKurlyOcrEngines()
+            ocr_engine, screening_ocr_engine = (
+                SHARED_OCR_EXECUTION_COORDINATOR.Execute(_BuildKurlyOcrEngines)
+            )
             pipeline = KurlyUrlIntakePipeline(
                 collector=collector,
                 ocrEngine=ocr_engine,
@@ -257,13 +258,7 @@ def CollectKurlyUrlFacts(
         artifactRootPath=artifact_root,
         maxOcrImageCount=max_ocr_images,
     )
-    if run_ocr:
-        # ponytail: 로컬 Paddle 모델은 직렬 재사용한다. 동시 처리량이 필요하면
-        # 별도 OCR worker로 옮긴다.
-        with _KURLY_OCR_RUNTIME_LOCK:
-            result = pipeline.Run(pipelineInput)
-    else:
-        result = pipeline.Run(pipelineInput)
+    result = pipeline.Run(pipelineInput)
     return BuildKurlyUrlFactsFromPipelineResult(
         url,
         result,
