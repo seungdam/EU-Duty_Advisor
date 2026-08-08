@@ -193,6 +193,7 @@ class KurlySmokeAppConfig(BaseModel):
     max_ocr_image_count: StrictInt = 8
     download_workers: StrictInt = 4
     max_queued_downloads: StrictInt = 4
+    max_pending_ocr_images: StrictInt = 4
     structured_ocr_max_tile_height_pixels: StrictInt = 2400
     structured_ocr_max_tile_side_pixels: StrictInt = 4000
     structured_ocr_tile_overlap_pixels: StrictInt = 240
@@ -262,6 +263,13 @@ class KurlySmokeAppConfig(BaseModel):
     def ValidateMaxQueuedDownloads(cls, value: int) -> int:
         if not 0 <= value <= 64:
             raise ValueError("max_queued_downloads must be between 0 and 64.")
+        return value
+
+    @field_validator("max_pending_ocr_images")
+    @classmethod
+    def ValidateMaxPendingOcrImages(cls, value: int) -> int:
+        if not 1 <= value <= 64:
+            raise ValueError("max_pending_ocr_images must be between 1 and 64.")
         return value
 
     def BuildStructuredOcrVlExtraOptions(self) -> dict[str, str]:
