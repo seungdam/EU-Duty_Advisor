@@ -21,6 +21,7 @@ from backend.api_contract import (
     RunNotFoundSsePayload,
     RunPausedSsePayload,
 )
+from backend.pipeline_executor import PipelineRunCapacityError, PipelineRunExecutor
 from backend.pipeline_projection import PipelineResultProjector
 from bussiness_logic.document.document_package_builder import BuildDocumentPackage
 from bussiness_logic.utils.json_types import JsonMapping, JsonObject, JsonValue
@@ -489,18 +490,38 @@ class PipelineRunService:
         self,
         registry: RunRegistry,
         pipelineCallable: PipelineCallable,
+        runExecutor: PipelineRunExecutor | None = None,
     ) -> None:
         self._registry = registry
         self._pipelineCallable = pipelineCallable
+        self._runExecutor = runExecutor
         self._answerLock = threading.Lock()
 
-    def StartBackgroundRun(self, runId: str, request: PipelineRunRequest) -> None:
-        thread = threading.Thread(
-            target=self.Run,
-            args=(runId, request),
-            daemon=True,
-        )
-        thread.start()
+    def StartBackgroundRun(
+        self,
+        runId: str,
+        request: PipelineRunRequest,
+    ) -> None:
+        if self._runExecutor is None:
+            raise RuntimeError("PipelineRunExecutor is required for background runs")
+        try:
+            self._runExecutor.Submit(
+                runId,
+                lambda: self.Run(runId, request),
+            )
+        except PipelineRunCapacityError:
+            self._registry.UpdateRun(
+                runId,
+                status="failed",
+                finished_at=time.time(),
+                error="pipeline_capacity_exhausted",
+            )
+            self._registry.AppendEvent(runId, {
+                "stage": "Pipeline",
+                "status": "failed",
+                "message": "Pipeline execution capacity is full.",
+            })
+            raise
 
     def Run(self, runId: str, request: PipelineRunRequest) -> None:
         self._registry.UpdateRun(

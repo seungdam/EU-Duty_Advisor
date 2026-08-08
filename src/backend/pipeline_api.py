@@ -21,6 +21,7 @@ from backend.api_contract import (
     RunCreateAcceptedResponse,
     RunCreateRequestPayload,
 )
+from backend.pipeline_executor import PipelineRunCapacityError
 from backend.pipeline_service import PipelineRunRequest, PipelineRunService, RunRegistry
 from bussiness_logic.utils.json_types import JsonMapping, JsonObject
 
@@ -404,7 +405,16 @@ class PipelineApi:
                 else None
             ),
         )
-        jobId, reused = self.StartPipelineRun(query=query, facts=facts)
+        try:
+            jobId, reused = self.StartPipelineRun(query=query, facts=facts)
+        except PipelineRunCapacityError as error:
+            return ApiErrorResponse(
+                error="pipeline_capacity_exhausted",
+                message="No pipeline execution capacity is currently available.",
+                field="job_id",
+                hint="Wait for a running or queued pipeline run to finish.",
+                job_id=error.runId,
+            ).ToDict(), 503
         snapshot = self._registry.BuildUiResult(jobId)
         return RunCreateAcceptedResponse(
             job_id=jobId,

@@ -31,12 +31,6 @@ provider = "anthropic"
 model = "claude-sonnet-4-6"
 api_key_env = "EU_EXPORT_ANTHROPIC_KEY"
 
-[llm_profiles.classification_selector]
-runtime = "openai"
-provider = "google_ai_studio"
-model = "gemini-3.5-flash"
-api_key_env = "EU_EXPORT_GOOGLE_AI_STUDIO_KEY"
-
 [llm_profiles.classification_validator]
 runtime = "openai"
 provider = "openai"
@@ -48,6 +42,10 @@ api_key_env = "EU_EXPORT_OPENAI_KEY"
 [embedding]
 enabled = true
 local_files_only = false
+
+[pipeline_execution]
+max_workers = 2
+max_queued_runs = 2
 
 [web]
 backend_host = "127.0.0.1"

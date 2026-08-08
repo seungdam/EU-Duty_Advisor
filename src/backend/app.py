@@ -9,6 +9,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from werkzeug.exceptions import NotFound
 
 from backend.pipeline_api import PipelineApi
+from backend.pipeline_executor import PipelineRunExecutor
 from backend.pipeline_service import PipelineRunService, RunRegistry
 
 PipelineCallable = Callable[..., dict[str, object]]
@@ -17,6 +18,8 @@ PipelineCallable = Callable[..., dict[str, object]]
 def CreateBackendApp(
     *,
     pipelineCallable: PipelineCallable | None = None,
+    pipelineRunMaxWorkers: int,
+    pipelineRunMaxQueuedRuns: int,
     allowedFrontendOrigins: Sequence[str] = (),
     webappDistDir: Path | None = None,
 ) -> Flask:
@@ -28,9 +31,14 @@ def CreateBackendApp(
         pipelineCallable = RunExportRequirementPipeline
 
     registry = RunRegistry()
+    runExecutor = PipelineRunExecutor(
+        maxWorkers=pipelineRunMaxWorkers,
+        maxQueuedRuns=pipelineRunMaxQueuedRuns,
+    )
     service = PipelineRunService(
         registry=registry,
         pipelineCallable=pipelineCallable,
+        runExecutor=runExecutor,
     )
     pipelineApi = PipelineApi(
         registry=registry,
@@ -38,6 +46,7 @@ def CreateBackendApp(
     )
 
     app = Flask(__name__)
+    app.extensions["pipeline_run_executor"] = runExecutor
     pipelineApi.RegisterRoutes(app)
     _RegisterCors(app, allowedFrontendOrigins)
 
