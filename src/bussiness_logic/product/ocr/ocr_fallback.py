@@ -3,6 +3,7 @@
 import json
 import re
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -409,7 +410,10 @@ class ProductOcrFallbackRunner:
         downloadExecutionCoordinator: Optional[
             DownloadExecutionCoordinator
         ] = None,
+        maxPendingOcrImages: int = 4,
     ) -> None:
+        if maxPendingOcrImages < 1:
+            raise ValueError("maxPendingOcrImages must be at least 1")
         self._ocrEngine = ocrEngine
         self._screeningEngine = screeningEngine
         self._imageDownloader = imageDownloader or ProductOcrImageDownloader(
@@ -426,6 +430,10 @@ class ProductOcrFallbackRunner:
         )
         self._downloadExecutionCoordinator = (
             downloadExecutionCoordinator or SHARED_DOWNLOAD_EXECUTION_COORDINATOR
+        )
+        self._maxPendingOcrImages = min(
+            maxPendingOcrImages,
+            self._downloadExecutionCoordinator.maxInFlight,
         )
 
     def Run(
@@ -445,22 +453,42 @@ class ProductOcrFallbackRunner:
         )
 
         selectedImageUrls = imageUrls[: max(0, maxImageCount)]
-        downloadFutures = [
-            self._downloadExecutionCoordinator.Submit(
-                lambda imageIndex=imageIndex, imageUrl=imageUrl: self._DownloadImage(
-                    imageIndex=imageIndex,
-                    imageUrl=imageUrl,
-                    artifactDirectory=artifactDirectory,
-                    downloadTimeoutSeconds=downloadTimeoutSeconds,
-                    reuseArtifactImages=reuseArtifactImages,
-                )
-            )
-            for imageIndex, imageUrl in enumerate(selectedImageUrls, start=1)
-        ]
-        downloadedImages = [future.result() for future in downloadFutures]
+        selectedImages = iter(enumerate(selectedImageUrls, start=1))
+        pendingDownloads: Dict[Future[_DownloadedOcrImage], int] = {}
 
-        imageResults: List[ProductOcrImageResult] = []
-        for downloadedImage in downloadedImages:
+        def SubmitUntilFull() -> None:
+            while len(pendingDownloads) < self._maxPendingOcrImages:
+                try:
+                    imageIndex, imageUrl = next(selectedImages)
+                except StopIteration:
+                    return
+                future = self._downloadExecutionCoordinator.Submit(
+                    lambda imageIndex=imageIndex, imageUrl=imageUrl: (
+                        self._DownloadImage(
+                            imageIndex=imageIndex,
+                            imageUrl=imageUrl,
+                            artifactDirectory=artifactDirectory,
+                            downloadTimeoutSeconds=downloadTimeoutSeconds,
+                            reuseArtifactImages=reuseArtifactImages,
+                        )
+                    )
+                )
+                pendingDownloads[future] = imageIndex
+
+        SubmitUntilFull()
+        imageResultsByIndex: Dict[int, ProductOcrImageResult] = {}
+        while pendingDownloads:
+            completedFutures, _ = wait(
+                tuple(pendingDownloads),
+                return_when=FIRST_COMPLETED,
+            )
+            completedFuture = min(
+                completedFutures,
+                key=lambda future: pendingDownloads[future],
+            )
+            pendingDownloads.pop(completedFuture)
+            downloadedImage = completedFuture.result()
+            SubmitUntilFull()
             imageResult = (
                 ProductOcrImageResult(
                     imageUrl=downloadedImage.imageUrl,
@@ -477,11 +505,17 @@ class ProductOcrFallbackRunner:
                     imageStatusCallback=imageStatusCallback,
                 )
             )
-            imageResults.append(imageResult)
+            imageResultsByIndex[downloadedImage.imageIndex] = imageResult
+
+        imageResults = [
+            imageResultsByIndex[imageIndex]
+            for imageIndex in range(1, len(selectedImageUrls) + 1)
+        ]
+        for imageIndex, imageResult in enumerate(imageResults, start=1):
             self._NotifyImageStatus(
                 imageStatusCallback,
-                downloadedImage.imageIndex,
-                downloadedImage.imageUrl,
+                imageIndex,
+                imageResult.imageUrl,
                 (
                     "failed"
                     if imageResult.error

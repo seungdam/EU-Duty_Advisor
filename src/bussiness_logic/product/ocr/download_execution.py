@@ -18,15 +18,18 @@ class DownloadExecutionCoordinator:
         if maxQueuedDownloads < 0:
             raise ValueError("maxQueuedDownloads must not be negative")
 
-        self._capacity = threading.BoundedSemaphore(
-            maxWorkers + maxQueuedDownloads,
-        )
+        self._maxInFlight = maxWorkers + maxQueuedDownloads
+        self._capacity = threading.BoundedSemaphore(self._maxInFlight)
         self._executor = ThreadPoolExecutor(
             max_workers=maxWorkers,
             thread_name_prefix="image-download",
         )
         self._stateLock = threading.Lock()
         self._isShutdown = False
+
+    @property
+    def maxInFlight(self) -> int:
+        return self._maxInFlight
 
     def Submit(
         self,

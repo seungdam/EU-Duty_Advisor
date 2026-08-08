@@ -44,6 +44,7 @@ class KurlyUrlIntakePipeline:
         downloadExecutionCoordinator: Optional[
             DownloadExecutionCoordinator
         ] = None,
+        maxPendingOcrImages: int = 4,
     ) -> None:
         self._collector = collector
         self._ocrEngine = ocrEngine
@@ -52,6 +53,7 @@ class KurlyUrlIntakePipeline:
         self._inputReconstructionService = inputReconstructionService
         self._imageStatusCallback = imageStatusCallback
         self._downloadExecutionCoordinator = downloadExecutionCoordinator
+        self._maxPendingOcrImages = maxPendingOcrImages
 
     def Run(
         self,
@@ -282,6 +284,7 @@ class KurlyUrlIntakePipeline:
             self._ocrEngine,
             screeningEngine=self._screeningOcrEngine,
             downloadExecutionCoordinator=self._downloadExecutionCoordinator,
+            maxPendingOcrImages=self._maxPendingOcrImages,
         )
         imageResults = ocrFallbackRunner.Run(
             imageUrls=collectionResult.ocrCandidateImageUrls,

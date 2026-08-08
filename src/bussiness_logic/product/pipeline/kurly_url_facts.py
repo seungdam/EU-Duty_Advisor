@@ -249,6 +249,7 @@ def CollectKurlyUrlFacts(
                 inputReconstructionService=input_reconstruction_service,
                 imageStatusCallback=imageStatusCallback,
                 downloadExecutionCoordinator=_BuildKurlyDownloadCoordinator(),
+                maxPendingOcrImages=smoke_config.max_pending_ocr_images,
             )
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"ocr_engine_unavailable: {exc}")
