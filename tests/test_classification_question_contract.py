@@ -265,6 +265,233 @@ def test_generic_not_contains_question_asks_positive_fact() -> None:
     )
 
 
+def test_gri3_and_gri6_d_fallback_questions_replay_as_axis_verdicts() -> None:
+    from bussiness_logic.classification.services.staged_classification import (
+        StagedClassificationTool,
+    )
+
+    tool = StagedClassificationTool()
+    for level, code, expected_rule in (
+        ("hs4", "1902", "gri3d"),
+        ("hs6", "190230", "gri6d"),
+        ("cn8", "19023090", "gri6d"),
+    ):
+        row = {
+            "code": code,
+            "descr": "Other prepared pasta",
+            "decision": "undecided",
+            "residual": True,
+            "decision_detail": [{
+                "cond": "processing_method",
+                "op": "axis_verdict",
+                "verdict": "residual",
+                "why": "axis_map:complement_only",
+                "value": "Other prepared pasta",
+            }],
+        }
+        assert tool._question_options(
+            [dict(row)],
+            level=level,
+            parents=[code[:-2]],
+            bti_summons=[],
+        ) == []
+
+        ranked = [dict(row)]
+        assert tool._append_gri_d_question_details(
+            ranked,
+            level=level,
+        ) == 1
+        questions = tool._question_options(
+            ranked,
+            level=level,
+            parents=[code[:-2]],
+            bti_summons=[],
+        )
+
+        assert len(questions) == 1
+        assert questions[0]["candidate_code"] == code
+        assert questions[0]["predicate_op"] == "axis_verdict"
+        assert questions[0]["required_facts"][0]["why"].startswith(
+            f"{expected_rule}:"
+        )
+
+        replayed = [dict(row)]
+        tool._apply_answer_overlays(
+            replayed,
+            {
+                "_classification_answer_facts": [{
+                    "question_key": questions[0]["question_key"],
+                    "answer": "yes",
+                }],
+            },
+            level=level,
+        )
+        assert replayed[0]["decision"] == "confirmed"
+
+
+def test_gri_d_fallback_survives_when_every_branch_is_violated() -> None:
+    from bussiness_logic.classification.services.staged_classification import (
+        StagedClassificationTool,
+    )
+
+    tool = StagedClassificationTool()
+    for level, codes in (
+        ("hs4", ("1902", "1905")),
+        ("hs6", ("190219", "190230")),
+        ("cn8", ("19023010", "19023090")),
+    ):
+        context_scope = (
+            "Prepared pasta branch"
+            if level == "hs6"
+            else ""
+        )
+        ranked = [
+            {
+                "code": code,
+                "descr": f"Branch {code}",
+                "decision": "violated",
+                "residual": False,
+                "decision_detail": [{
+                    "cond": "product_identity",
+                    "op": "has_token",
+                    "verdict": "false",
+                    "field": "identity_hints.commercial_identity",
+                    "why": "canonical_field_mismatch",
+                    "value": f'["branch {code}"]',
+                }],
+                "context_scope": context_scope,
+                "context_decision": (
+                    "violated"
+                    if context_scope
+                    else ""
+                ),
+                "context_detail": (
+                    [{
+                        "cond": "branch_context",
+                        "op": "context_observation",
+                        "verdict": "false",
+                        "field": "",
+                        "why": "context_observation:mismatch",
+                        "value": f'["{context_scope}"]',
+                    }]
+                    if context_scope
+                    else []
+                ),
+            }
+            for code in codes
+        ]
+
+        assert tool._append_gri_d_question_details(
+            ranked,
+            level=level,
+        ) == len(codes)
+        questions = tool._question_options(
+            ranked,
+            level=level,
+            parents=[codes[0][:-2]],
+            bti_summons=[],
+        )
+
+        assert len(questions) == len(codes)
+        assert all(
+            question["required_facts"][0]["why"].startswith(
+                ("gri3d:", "gri6d:"),
+            )
+            for question in questions
+        )
+
+        tool._apply_answer_overlays(
+            ranked,
+            {
+                "_classification_answer_facts": [
+                    {
+                        "question_key": questions[0]["question_key"],
+                        "answer": "yes",
+                    },
+                    {
+                        "question_key": questions[1]["question_key"],
+                        "answer": "no",
+                    },
+                ],
+            },
+            level=level,
+        )
+        assert ranked[0]["decision"] == "confirmed"
+        if context_scope:
+            assert ranked[0]["context_decision"] == "confirmed"
+        assert ranked[1]["decision"] == "violated"
+
+
+def test_classify_exposes_gri3_and_gri6_d_questions_when_authority_is_empty(
+    monkeypatch,
+) -> None:
+    from bussiness_logic.classification.services import axis_verdict
+    from bussiness_logic.classification.services.staged_classification import (
+        StagedClassificationTool,
+    )
+
+    monkeypatch.setenv("ASAP_STAGED_DECISION_TABLE", "0")
+    monkeypatch.setenv("ASAP_STAGED_PREDICATES", "0")
+    monkeypatch.setenv("ASAP_BTI_RECALL", "0")
+    monkeypatch.setenv("ASAP_PRECEDENT_LEAD", "0")
+    monkeypatch.setattr(axis_verdict, "StampHs4AxisVerdicts", lambda *_args: 0)
+    monkeypatch.setattr(axis_verdict, "StampHs6AxisVerdicts", lambda *_args: 0)
+    monkeypatch.setattr(axis_verdict, "StampCn8AxisVerdicts", lambda *_args: 0)
+
+    for level, parent, codes, expected_rule in (
+        ("hs4", "19", ("1902", "1905"), "gri3d_question_required"),
+        ("hs6", "1902", ("190219", "190230"), "gri6d_question_required"),
+        ("cn8", "190230", ("19023010", "19023090"), "gri6d_question_required"),
+    ):
+        class FixtureTool(StagedClassificationTool):
+            @staticmethod
+            def _load_branch_rows(candidate_level, parents):
+                if candidate_level != level or tuple(parents) != (parent,):
+                    return ()
+                return tuple(
+                    {
+                        "code": code,
+                        "parent_code": parent,
+                        "option_label_en": f"Branch {code}",
+                    }
+                    for code in codes
+                )
+
+            def _branch_rank(self, branch_rows, *_args, **_kwargs):
+                return [
+                    {
+                        "code": str(row["code"]),
+                        "descr": str(row["option_label_en"]),
+                        "incl": "",
+                        "excl": "",
+                        "residual": False,
+                        "score": 0.0,
+                        "matched": [],
+                        "neg_matched": [],
+                        "predicate_results": [],
+                        "decision": "undecided",
+                        "decision_detail": [],
+                        "context_scope": "",
+                        "context_decision": "",
+                        "context_detail": [],
+                        "context_observation": {},
+                        "quantitative_verdict": {"verdict": "neutral"},
+                    }
+                    for row in branch_rows
+                ]
+
+        result = FixtureTool().classify(
+            product_facts={},
+            routing_context={},
+            start_parents=[parent],
+        )
+
+        assert result["classification_status"] == "needs_more_facts"
+        assert result["unresolved_stage"] == level
+        assert result["pending_user_questions"]
+        assert result["stages"][-1]["decision_fallback"] == expected_rule
+
+
 def test_hs6_context_uses_question_contract_without_offline_csv() -> None:
     from bussiness_logic.classification.services.staged_classification import (
         StagedClassificationTool,
