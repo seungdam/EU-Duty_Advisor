@@ -1,0 +1,16 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: eu-duty-advisor:demo
+    container_name: eu-duty-demo
+
+    env_file:
+      - ./config/.env.asap_app
+
+    ports:
+      - "127.0.0.1:8060:8060"
+
+    restart: unless-stopped
