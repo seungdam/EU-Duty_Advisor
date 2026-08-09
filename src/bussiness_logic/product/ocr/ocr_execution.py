@@ -11,9 +11,11 @@ OcrResult = TypeVar("OcrResult")
 class OcrExecutionCoordinator:
     """Run shared OCR engine operations on one process-local worker."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, maxWorkers: int = 1) -> None:
+        if maxWorkers != 1:
+            raise ValueError("shared OCR maxWorkers must remain 1")
         self._executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=maxWorkers,
             thread_name_prefix="shared-ocr",
         )
 
@@ -25,3 +27,11 @@ class OcrExecutionCoordinator:
 
 
 SHARED_OCR_EXECUTION_COORDINATOR = OcrExecutionCoordinator()
+
+
+def GetSharedOcrExecutionCoordinator(
+    maxWorkers: int = 1,
+) -> OcrExecutionCoordinator:
+    if maxWorkers != 1:
+        raise ValueError("shared OCR maxWorkers must remain 1")
+    return SHARED_OCR_EXECUTION_COORDINATOR

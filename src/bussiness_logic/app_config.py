@@ -186,6 +186,8 @@ class KurlySmokeAppConfig(BaseModel):
     )
     timeout_seconds: StrictInt = 60
     scroll_count: StrictInt = 8
+    crawl_concurrency: StrictInt = 1
+    ocr_workers: StrictInt = 1
     headless: StrictBool = True
     run_ocr_fallback: StrictBool = True
     use_structured_ocr: StrictBool = True
@@ -249,6 +251,20 @@ class KurlySmokeAppConfig(BaseModel):
     def ValidateMaxOcrImageCount(cls, value: int) -> int:
         if value < 0:
             raise ValueError("max_ocr_image_count must be non-negative.")
+        return value
+
+    @field_validator("crawl_concurrency")
+    @classmethod
+    def ValidateCrawlConcurrency(cls, value: int) -> int:
+        if not 1 <= value <= 4:
+            raise ValueError("crawl_concurrency must be between 1 and 4.")
+        return value
+
+    @field_validator("ocr_workers")
+    @classmethod
+    def ValidateOcrWorkers(cls, value: int) -> int:
+        if value != 1:
+            raise ValueError("ocr_workers must remain 1.")
         return value
 
     @field_validator("download_workers")

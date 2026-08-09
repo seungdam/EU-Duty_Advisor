@@ -12,6 +12,7 @@ from bussiness_logic.product.ocr.ocr_fallback import (
 from bussiness_logic.product.ocr.download_execution import (
     DownloadExecutionCoordinator,
 )
+from bussiness_logic.product.ocr.ocr_execution import OcrExecutionCoordinator
 from bussiness_logic.product.ocr.ocr_normalization import (
     ProductOcrFactNormalizationResult,
     ProductOcrFactNormalizer,
@@ -44,6 +45,7 @@ class KurlyUrlIntakePipeline:
         downloadExecutionCoordinator: Optional[
             DownloadExecutionCoordinator
         ] = None,
+        ocrExecutionCoordinator: Optional[OcrExecutionCoordinator] = None,
         maxPendingOcrImages: int = 4,
     ) -> None:
         self._collector = collector
@@ -53,6 +55,7 @@ class KurlyUrlIntakePipeline:
         self._inputReconstructionService = inputReconstructionService
         self._imageStatusCallback = imageStatusCallback
         self._downloadExecutionCoordinator = downloadExecutionCoordinator
+        self._ocrExecutionCoordinator = ocrExecutionCoordinator
         self._maxPendingOcrImages = maxPendingOcrImages
 
     def Run(
@@ -284,6 +287,7 @@ class KurlyUrlIntakePipeline:
             self._ocrEngine,
             screeningEngine=self._screeningOcrEngine,
             downloadExecutionCoordinator=self._downloadExecutionCoordinator,
+            ocrExecutionCoordinator=self._ocrExecutionCoordinator,
             maxPendingOcrImages=self._maxPendingOcrImages,
         )
         imageResults = ocrFallbackRunner.Run(

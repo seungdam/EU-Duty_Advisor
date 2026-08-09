@@ -42,6 +42,9 @@ from bussiness_logic.product.ocr.ocr_fallback import (  # noqa: E402
 from bussiness_logic.product.ocr.download_execution import (  # noqa: E402
     DownloadExecutionCoordinator,
 )
+from bussiness_logic.product.ocr.ocr_execution import (  # noqa: E402
+    GetSharedOcrExecutionCoordinator,
+)
 from bussiness_logic.product.pipeline.kurly_url_intake_pipeline import (  # noqa: E402
     KurlyUrlIntakePipeline,
 )
@@ -53,6 +56,7 @@ from bussiness_logic.product.web_parser.kurly_domestic import (  # noqa: E402
 )
 from bussiness_logic.product.web_parser.kurly_global import KurlyGlobalPageParser  # noqa: E402
 from bussiness_logic.product.web_parser.kurly_market_collector import (  # noqa: E402
+    GetSharedKurlyCrawlerGate,
     KurlyPageCollector,
 )
 from bussiness_logic.product.web_parser.kurly_market_schema import (  # noqa: E402
@@ -899,6 +903,9 @@ class KurlyMarketSmokeRunner:
         self._productUrls = list(productUrls or smokeConfig.product_urls)
         self._timeoutSeconds = smokeConfig.timeout_seconds
         self._scrollCount = smokeConfig.scroll_count
+        self._crawlerConcurrencyGate = GetSharedKurlyCrawlerGate(
+            smokeConfig.crawl_concurrency,
+        )
         self._headless = False if showBrowser else smokeConfig.headless
         self._compareOcr = compareOcr
         self._compareMaxImages = compareMaxImages
@@ -913,6 +920,9 @@ class KurlyMarketSmokeRunner:
             maxQueuedDownloads=smokeConfig.max_queued_downloads,
         )
         self._maxPendingOcrImages = smokeConfig.max_pending_ocr_images
+        self._ocrExecutionCoordinator = GetSharedOcrExecutionCoordinator(
+            smokeConfig.ocr_workers,
+        )
         self._structuredOcrMaxTileHeightPixels = (
             smokeConfig.structured_ocr_max_tile_height_pixels
         )
@@ -1209,6 +1219,7 @@ class KurlyMarketSmokeRunner:
             headless=self._headless,
             timeoutMilliseconds=self._timeoutSeconds * 1000,
             scrollCount=self._scrollCount,
+            concurrencyGate=self._crawlerConcurrencyGate,
         )
         inputReconstructionService = self._BuildInputReconstructionService()
         ocrEngine = None
@@ -1236,6 +1247,7 @@ class KurlyMarketSmokeRunner:
             screeningOcrEngine=screeningOcrEngine,
             inputReconstructionService=inputReconstructionService,
             downloadExecutionCoordinator=self._downloadExecutionCoordinator,
+            ocrExecutionCoordinator=self._ocrExecutionCoordinator,
             maxPendingOcrImages=self._maxPendingOcrImages,
         )
 

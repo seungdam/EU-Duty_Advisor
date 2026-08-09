@@ -58,6 +58,8 @@ allowed_frontend_origins = [
 [kurly_smoke]
 run_ocr_fallback = true
 use_structured_ocr = true
+crawl_concurrency = 1
+ocr_workers = 1
 download_workers = 4
 max_queued_downloads = 4
 max_pending_ocr_images = 4

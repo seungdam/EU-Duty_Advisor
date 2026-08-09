@@ -1,5 +1,6 @@
 """KurlyMarket product page collection via Playwright."""
 
+from threading import BoundedSemaphore, Lock
 from typing import List, Optional, Protocol
 from urllib.parse import urljoin, urlparse
 
@@ -66,6 +67,30 @@ class KurlyCollectionError(RuntimeError):
     """KurlyMarket 상품 페이지 수집이 실패했을 때 사용한다."""
 
 
+_CRAWLER_GATE_LOCK = Lock()
+_SHARED_CRAWLER_GATE: BoundedSemaphore | None = None
+_SHARED_CRAWLER_CONCURRENCY: int | None = None
+
+
+def GetSharedKurlyCrawlerGate(maxConcurrency: int = 1) -> BoundedSemaphore:
+    """Return the single Playwright concurrency gate for this process."""
+
+    if maxConcurrency < 1:
+        raise ValueError("maxConcurrency must be at least 1")
+    global _SHARED_CRAWLER_GATE, _SHARED_CRAWLER_CONCURRENCY
+    with _CRAWLER_GATE_LOCK:
+        if _SHARED_CRAWLER_GATE is None:
+            _SHARED_CRAWLER_GATE = BoundedSemaphore(maxConcurrency)
+            _SHARED_CRAWLER_CONCURRENCY = maxConcurrency
+        elif _SHARED_CRAWLER_CONCURRENCY != maxConcurrency:
+            raise RuntimeError(
+                "Kurly crawler concurrency is already configured as {0}".format(
+                    _SHARED_CRAWLER_CONCURRENCY,
+                )
+            )
+        return _SHARED_CRAWLER_GATE
+
+
 class KurlyPageCollector:
     """Playwright로 KurlyMarket 상품 페이지를 제한 스크롤해 수집한다."""
 
@@ -88,6 +113,7 @@ class KurlyPageCollector:
         timeoutMilliseconds: Optional[int] = None,
         scrollCount: Optional[int] = None,
         scrollWaitMilliseconds: Optional[int] = None,
+        concurrencyGate: Optional[BoundedSemaphore] = None,
     ) -> None:
         timeoutMilliseconds = (
             self.DEFAULT_TIMEOUT_MILLISECONDS
@@ -118,6 +144,9 @@ class KurlyPageCollector:
         self._timeoutMilliseconds = timeoutMilliseconds
         self._scrollCount = scrollCount
         self._scrollWaitMilliseconds = scrollWaitMilliseconds
+        self._concurrencyGate = (
+            concurrencyGate or GetSharedKurlyCrawlerGate()
+        )
 
     def Collect(self, productPageUrl: str) -> KurlyCollectionResult:
         self.ValidateProductPageUrl(productPageUrl)
@@ -137,6 +166,13 @@ class KurlyPageCollector:
         productPageUrl: str,
     ) -> RenderedPageEvidence:
         self.ValidateProductPageUrl(productPageUrl)
+        with self._concurrencyGate:
+            return self._CollectRenderedPageEvidence(productPageUrl)
+
+    def _CollectRenderedPageEvidence(
+        self,
+        productPageUrl: str,
+    ) -> RenderedPageEvidence:
 
         try:
             from playwright.sync_api import sync_playwright

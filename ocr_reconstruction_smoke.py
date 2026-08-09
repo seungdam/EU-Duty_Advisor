@@ -69,6 +69,7 @@ from bussiness_logic.product.ocr.vlm_adapter import BridgeVlmAdapter
 from bussiness_logic.product.web_parser.kurly_domestic import KurlyDomesticPageParser
 from bussiness_logic.product.web_parser.kurly_global import KurlyGlobalPageParser
 from bussiness_logic.product.web_parser.kurly_market_collector import (
+    GetSharedKurlyCrawlerGate,
     KurlyPageCollector,
 )
 from bussiness_logic.product.web_parser.kurly_market_schema import (
@@ -743,6 +744,9 @@ def BuildCollector(appConfig: AppConfig, headed: bool) -> KurlyPageCollector:
         headless=False if headed else smokeConfig.headless,
         timeoutMilliseconds=smokeConfig.timeout_seconds * 1000,
         scrollCount=smokeConfig.scroll_count,
+        concurrencyGate=GetSharedKurlyCrawlerGate(
+            smokeConfig.crawl_concurrency,
+        ),
     )
 
 

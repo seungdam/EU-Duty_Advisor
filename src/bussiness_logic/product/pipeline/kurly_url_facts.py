@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol
 from bussiness_logic.artifact_paths import ExtractProductIdFromUrl
 from bussiness_logic.pipeline.run_paths import APP_CONFIG, PROJECT_ROOT
 from bussiness_logic.product.ocr.ocr_execution import (
-    SHARED_OCR_EXECUTION_COORDINATOR,
+    GetSharedOcrExecutionCoordinator,
 )
 from bussiness_logic.product.ocr.download_execution import (
     DownloadExecutionCoordinator,
@@ -208,7 +208,10 @@ def CollectKurlyUrlFacts(
     )
     from bussiness_logic.product.web_parser.kurly_domestic import KurlyDomesticPageParser
     from bussiness_logic.product.web_parser.kurly_global import KurlyGlobalPageParser
-    from bussiness_logic.product.web_parser.kurly_market_collector import KurlyPageCollector
+    from bussiness_logic.product.web_parser.kurly_market_collector import (
+        GetSharedKurlyCrawlerGate,
+        KurlyPageCollector,
+    )
     from bussiness_logic.product.web_parser.kurly_page_adapter import KurlyPageAdapter
 
     warnings: list[str] = []
@@ -234,13 +237,19 @@ def CollectKurlyUrlFacts(
         headless=headless,
         timeoutMilliseconds=timeout_seconds * 1000,
         scrollCount=scroll_count,
+        concurrencyGate=GetSharedKurlyCrawlerGate(
+            smoke_config.crawl_concurrency,
+        ),
     )
     input_reconstruction_service = _BuildInputReconstructionService(warnings)
 
     if run_ocr:
         try:
+            ocrExecutionCoordinator = GetSharedOcrExecutionCoordinator(
+                smoke_config.ocr_workers,
+            )
             ocr_engine, screening_ocr_engine = (
-                SHARED_OCR_EXECUTION_COORDINATOR.Execute(_BuildKurlyOcrEngines)
+                ocrExecutionCoordinator.Execute(_BuildKurlyOcrEngines)
             )
             pipeline = KurlyUrlIntakePipeline(
                 collector=collector,
@@ -249,6 +258,7 @@ def CollectKurlyUrlFacts(
                 inputReconstructionService=input_reconstruction_service,
                 imageStatusCallback=imageStatusCallback,
                 downloadExecutionCoordinator=_BuildKurlyDownloadCoordinator(),
+                ocrExecutionCoordinator=ocrExecutionCoordinator,
                 maxPendingOcrImages=smoke_config.max_pending_ocr_images,
             )
         except Exception as exc:  # noqa: BLE001
