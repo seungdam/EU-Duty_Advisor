@@ -1,0 +1,34 @@
+name: eu-duty-automatation-demo
+
+services:
+  app:
+    image: eu-duty-automatation:local
+    ports:
+      - "127.0.0.1:8060:8060"
+    environment:
+      - ASAP_DATABASE_URL
+      - ASAP_CLASSIFICATION_DATABASE_URL
+      - EU_EXPORT_GOOGLE_AI_STUDIO_KEY
+      - EU_EXPORT_OPENAI_KEY
+      - EU_EXPORT_ANTHROPIC_KEY
+    healthcheck:
+      test:
+        - CMD
+        - /opt/conda/envs/asap_pw/bin/python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8060/api/health', timeout=2).close()
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:?CLOUDFLARE_TUNNEL_TOKEN is required}"
+    depends_on:
+      app:
+        condition: service_healthy
