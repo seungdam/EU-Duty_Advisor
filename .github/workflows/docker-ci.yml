@@ -1,0 +1,67 @@
+name: Docker Runtime CI
+
+on:
+  push:
+    branches:
+      - feat/architecture
+    paths:
+      - "Dockerfile"
+      - "environments.yml"
+      - "src/**"
+      - "db/**"
+      - "tests/**"
+      - "webapp/**"
+      - "asap_app.py"
+      - "config/**"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: eu-duty-advisor:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: Runtime import smoke test
+        run: |
+          docker run --rm \
+            --entrypoint /opt/conda/envs/asap_pw/bin/python \
+            eu-duty-advisor:ci \
+            -c "import paddle, torch, playwright; print('RUNTIME_IMPORT_OK')"
+
+      - name: Chromium smoke test
+        run: |
+          docker run --rm \
+            --entrypoint /opt/conda/envs/asap_pw/bin/python \
+            eu-duty-advisor:ci \
+            -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); print('CHROMIUM_OK'); b.close(); p.stop()"
+
+      - name: Backend tests
+        run: |
+          docker run --rm \
+            --entrypoint /opt/conda/envs/asap_pw/bin/python \
+            eu-duty-advisor:ci \
+            -m pytest -q
