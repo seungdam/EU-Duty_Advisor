@@ -541,6 +541,7 @@ def test_hs6_context_uses_question_contract_without_offline_csv() -> None:
         "제품이 다음 HS6 분류 범위에 해당합니까: "
         "Octopus, prepared or preserved?"
     )
+    assert questions[0]["question_key"] == "cq_b03999e7671bd876f821"
 
     answered = tool._rank_sibling_group(
         items,
@@ -575,6 +576,7 @@ def test_hs6_context_uses_question_contract_without_offline_csv() -> None:
     rejected[0]["decision"] = "confirmed"
 
     assert rejected[0]["context_decision"] == "violated"
+    assert rejected[1]["context_decision"] == "undecided"
     assert tool._authoritative_selection([rejected[0]]) == ("", "none")
 
 

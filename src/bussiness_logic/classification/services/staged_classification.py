@@ -2852,7 +2852,8 @@ class StagedClassificationTool:
                 condition.get("verdict") or "SILENCE"
             ).upper()
             details.append({
-                "cond": str(condition.get("axis") or "branch_context"),
+                "cond": "branch_context",
+                "axis": str(condition.get("axis") or "branch_context"),
                 "op": (
                     "not_contains"
                     if str(condition.get("expected") or "") == "not"
@@ -3206,11 +3207,11 @@ class StagedClassificationTool:
                 ):
                     subject = ", ".join(values) or description
                     question_text = f"제품 상태 또는 형태가 다음 조건에 해당합니까: {subject}?"
-                elif predicate_op == "not_contains":
+                elif predicate_op == "not_contains" and condition != "branch_context":
                     subject = ", ".join(values) or description
                     question_text = f"제품에 다음 분류 특성 또는 값이 존재합니까: {subject}?"
                 elif condition == "branch_context":
-                    subject = ", ".join(values) or context_scope or description
+                    subject = context_scope or ", ".join(values) or description
                     question_text = f"제품이 다음 HS6 분류 범위에 해당합니까: {subject}?"
                 else:
                     level_name = {
