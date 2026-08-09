@@ -21,12 +21,10 @@ class ClassificationComponent(BasePipelineComponent):
     def __init__(
         self,
         *,
-        selectionRuntimeAdapter: object | None = None,
         validationRuntimeAdapter: object | None = None,
     ) -> None:
         super().__init__()
         self._taric_resolver = TaricBranchResolverTool()
-        self._selectionRuntimeAdapter = selectionRuntimeAdapter
         self._validationRuntimeAdapter = validationRuntimeAdapter
         self._stagedFailure: JsonObject = {}
 
@@ -116,16 +114,9 @@ class ClassificationComponent(BasePipelineComponent):
             if _ds_sig:
                 self.reason(f"Derived state (deterministic): {_ds_sig}")
 
-            runtimeAdapters = {}
-            if self._selectionRuntimeAdapter is not None:
-                runtimeAdapters["selectionRuntimeAdapter"] = (
-                    self._selectionRuntimeAdapter
-                )
-            if self._validationRuntimeAdapter is not None:
-                runtimeAdapters["validationRuntimeAdapter"] = (
-                    self._validationRuntimeAdapter
-                )
-            stagedTool = StagedClassificationTool(**runtimeAdapters)
+            stagedTool = StagedClassificationTool(
+                validationRuntimeAdapter=self._validationRuntimeAdapter,
+            )
             staged = stagedTool.classify(
                 product_facts=product_facts,
                 routing_context=routing,
@@ -193,84 +184,79 @@ class ClassificationComponent(BasePipelineComponent):
                     failureStage or "classification",
                 )
 
-            # Final validation (existing recommendation seam): closed-choice
-            # veto over recorded recovery/reroute options. A fired override is
-            # one more classify() pass inside the approved scope; a failed
-            # second pass keeps the original result (deterministic guard).
+            # Validator는 기록된 대안만 검토하고 결과 변경 없이 관측값을 남긴다.
             validatorRecord: dict | None = None
-            validatorFlag = (os.environ.get("ASAP_STAGED_VALIDATOR", "1") or "").strip().lower()
-            if validatorFlag in ("1", "true", "yes", "on"):
-                verdict = stagedTool.validate_selection(
-                    staged=staged,
-                    product_facts=product_facts,
-                    routing_context=routing,
+            verdict = stagedTool.validate_selection(
+                staged=staged,
+                product_facts=product_facts,
+                routing_context=routing,
+            )
+            if verdict.get("fired"):
+                validatorRecord = dict(verdict)
+            scope = verdict.get("code") or verdict.get("chapter") or verdict.get("heading")
+            if verdict.get("verdict") == "reroute" and scope:
+                # reroute = 라우터 의견 '복원' 전용: 대상 챕터가 라우터
+                # 자체 순위에서 staged 최종 챕터보다 높을 때만 허용.
+                # staged가 강해진 뒤 reroute는 구제 풀이 말라 개악만 남았다
+                # (최종 기준런 실측: 개악 3 — 쪽갈비 16→02, 떡볶이·산채
+                # 19→21 — vs 구제 1). validator가 제3의 챕터를 발명하는
+                # 것을 구조로 금지한다. ASAP_VALIDATOR_REROUTE_RESTORE_ONLY=0 복귀.
+                restore_only = (os.environ.get(
+                    "ASAP_VALIDATOR_REROUTE_RESTORE_ONLY", "1") or "1").strip() != "0"
+                if restore_only:
+                    order = [
+                        str(d.get("chapter"))
+                        for d in ((routing or {}).get("candidate_chapter_details") or [])
+                        if isinstance(d, dict)
+                    ]
+                    target_ch = str(scope)[:2].zfill(2)
+                    current_ch = str((candidates[0] or {}).get("cn8") or "")[:2]
+                    t_rank = order.index(target_ch) if target_ch in order else 999
+                    c_rank = order.index(current_ch) if current_ch in order else 999
+                    if t_rank >= c_rank:
+                        validatorRecord = {
+                            **verdict,
+                            "applied": False,
+                            "blocked": "reroute_restore_only",
+                        }
+                        self.reason(
+                            f"Validator reroute->{target_ch} blocked: not a router-"
+                            f"restore (router rank {t_rank} vs current {c_rank})."
+                        )
+                        scope = None
+            # [11회차 2-C] Validator 개입 권한 **전면** 폐지 완결
+            # (CYCLE9_SPEC §6 원안·설계자 (b)안 확정). 10회차 이식이
+            # promote_recovery/reroute/narrow만 폐지하고
+            # promote_candidate를 남겨 불완전 집행됐던 것을 여기서
+            # 종결한다 — 이제 네 판정 유형 전부가 '기록만'이다.
+            # 폐지 근거(오염 실측): 22캐시 95% 헤드라인에 청양고추
+            # 2001→0710·대구살 0309·기저귀 3923 교체가 우리 기전
+            # 성과로 오귀속돼 측정기가 거짓말을 하고 있었다. 손실
+            # 케이스는 '결정층 취약 지대 지도'로 남는다(관측 전용
+            # 설계의 산출물 — would_have_* 실물 보존).
+            _verdict_kind = str(verdict.get("verdict") or "")
+            _would_pick = str(verdict.get("cn8") or "") if (
+                _verdict_kind == "promote_candidate") else ""
+            if _verdict_kind in ("promote_candidate", "promote_recovery",
+                                 "reroute", "narrow") and (scope or _would_pick):
+                scope = str(scope or "")
+                if len(scope) == 8:
+                    scope = scope[:6]
+                validatorRecord = {
+                    **verdict,
+                    "applied": False,
+                    "authority_revoked": True,
+                    "revoked_kind": _verdict_kind,
+                    "would_have_scope": scope,
+                    "would_have_pick": _would_pick,
+                    "original_top_cn8": str(
+                        (candidates[0] or {}).get("cn8") or ""),
+                }
+                self.reason(
+                    f"Validator authority revoked (observe-only): "
+                    f"{_verdict_kind} -> {scope or _would_pick} recorded, "
+                    f"not applied."
                 )
-                if verdict.get("fired"):
-                    validatorRecord = dict(verdict)
-                scope = verdict.get("code") or verdict.get("chapter") or verdict.get("heading")
-                if verdict.get("verdict") == "reroute" and scope:
-                    # reroute = 라우터 의견 '복원' 전용: 대상 챕터가 라우터
-                    # 자체 순위에서 staged 최종 챕터보다 높을 때만 허용.
-                    # staged가 강해진 뒤 reroute는 구제 풀이 말라 개악만 남았다
-                    # (최종 기준런 실측: 개악 3 — 쪽갈비 16→02, 떡볶이·산채
-                    # 19→21 — vs 구제 1). validator가 제3의 챕터를 발명하는
-                    # 것을 구조로 금지한다. ASAP_VALIDATOR_REROUTE_RESTORE_ONLY=0 복귀.
-                    restore_only = (os.environ.get(
-                        "ASAP_VALIDATOR_REROUTE_RESTORE_ONLY", "1") or "1").strip() != "0"
-                    if restore_only:
-                        order = [
-                            str(d.get("chapter"))
-                            for d in ((routing or {}).get("candidate_chapter_details") or [])
-                            if isinstance(d, dict)
-                        ]
-                        target_ch = str(scope)[:2].zfill(2)
-                        current_ch = str((candidates[0] or {}).get("cn8") or "")[:2]
-                        t_rank = order.index(target_ch) if target_ch in order else 999
-                        c_rank = order.index(current_ch) if current_ch in order else 999
-                        if t_rank >= c_rank:
-                            validatorRecord = {
-                                **verdict,
-                                "applied": False,
-                                "blocked": "reroute_restore_only",
-                            }
-                            self.reason(
-                                f"Validator reroute->{target_ch} blocked: not a router-"
-                                f"restore (router rank {t_rank} vs current {c_rank})."
-                            )
-                            scope = None
-                # [11회차 2-C] Validator 개입 권한 **전면** 폐지 완결
-                # (CYCLE9_SPEC §6 원안·설계자 (b)안 확정). 10회차 이식이
-                # promote_recovery/reroute/narrow만 폐지하고
-                # promote_candidate를 남겨 불완전 집행됐던 것을 여기서
-                # 종결한다 — 이제 네 판정 유형 전부가 '기록만'이다.
-                # 폐지 근거(오염 실측): 22캐시 95% 헤드라인에 청양고추
-                # 2001→0710·대구살 0309·기저귀 3923 교체가 우리 기전
-                # 성과로 오귀속돼 측정기가 거짓말을 하고 있었다. 손실
-                # 케이스는 '결정층 취약 지대 지도'로 남는다(관측 전용
-                # 설계의 산출물 — would_have_* 실물 보존).
-                _verdict_kind = str(verdict.get("verdict") or "")
-                _would_pick = str(verdict.get("cn8") or "") if (
-                    _verdict_kind == "promote_candidate") else ""
-                if _verdict_kind in ("promote_candidate", "promote_recovery",
-                                     "reroute", "narrow") and (scope or _would_pick):
-                    scope = str(scope or "")
-                    if len(scope) == 8:
-                        scope = scope[:6]
-                    validatorRecord = {
-                        **verdict,
-                        "applied": False,
-                        "authority_revoked": True,
-                        "revoked_kind": _verdict_kind,
-                        "would_have_scope": scope,
-                        "would_have_pick": _would_pick,
-                        "original_top_cn8": str(
-                            (candidates[0] or {}).get("cn8") or ""),
-                    }
-                    self.reason(
-                        f"Validator authority revoked (observe-only): "
-                        f"{_verdict_kind} -> {scope or _would_pick} recorded, "
-                        f"not applied."
-                    )
 
             ccs_id = store.next_id("ccs")
             ccs_candidates: list[dict] = []

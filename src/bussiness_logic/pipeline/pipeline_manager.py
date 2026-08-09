@@ -128,11 +128,6 @@ class ExportPipelineManager:
                             LlmProfileName.HS2_ROUTER,
                         )
                     ),
-                    selectionRuntimeAdapter=(
-                        BuildOptionalPipelineRuntimeAdapter(
-                            LlmProfileName.CLASSIFICATION_SELECTOR,
-                        )
-                    ),
                     validationRuntimeAdapter=(
                         BuildOptionalPipelineRuntimeAdapter(
                             LlmProfileName.CLASSIFICATION_VALIDATOR,

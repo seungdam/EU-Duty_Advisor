@@ -640,10 +640,8 @@ class StagedClassificationTool:
         *,
         keep_per_level: int = 3,
         rank_top_k: int = 8,
-        selectionRuntimeAdapter: object | None = None,
         validationRuntimeAdapter: object | None = None,
     ) -> None:
-        self._selectionRuntimeAdapter = selectionRuntimeAdapter
         self._validationRuntimeAdapter = validationRuntimeAdapter
         self.keep_per_level = keep_per_level
         self.rank_top_k = rank_top_k
@@ -2593,50 +2591,8 @@ class StagedClassificationTool:
         scored.sort(key=lambda r: r["score"], reverse=True)
         return scored
 
-    # ---- LLM select (bridge) ---------------------------------------------
-    def _llm_select(self, ranked: list[dict[str, Any]], facts: dict[str, list[str]], level: str) -> list[str]:
-        if not ranked:
-            return []
-        # code_driven by default (designer decision): the deterministic lexical
-        # top-k is the stage answer; the LLM re-selector is opt-in only.
-        if (os.environ.get("ASAP_STAGED_USE_LLM_SELECT", "0") or "").strip().lower() not in (
-            "1", "true", "yes", "on",
-        ):
-            return [r["code"] for r in ranked[: self.keep_per_level]]
-        if self._selectionRuntimeAdapter is None:
-            return []
-        from bussiness_logic.bridge.schema import LlmRequest, LlmGenerationOptions
-
-        facts_view = {axis: facts.get(axis, [])[:8] for axis in LEVEL_AXES[level]}
-        cand_view = [{"code": r["code"], "desc": (r["descr"] or "")[:180]} for r in ranked]
-        prompt = (
-            f"Select up to {self.keep_per_level} best EU CN {level.upper()} prefixes for this product.\n"
-            f"Product facts (decision axes):\n{json.dumps(facts_view, ensure_ascii=False)}\n"
-            f"Candidate {level.upper()} nodes:\n{json.dumps(cand_view, ensure_ascii=False)}\n"
-            'Return ONE JSON object only: {"selected":["<code>",...],"basis":"<short reason>"}.\n'
-            "Prefer nodes whose description matches the commodity + form. No codes outside the candidates."
-        )
-        try:
-            resp = self._selectionRuntimeAdapter.Generate(
-                LlmRequest(
-                    user_prompt=prompt,
-                    system_prompt="You pick EU customs classification prefixes. Output one JSON object only.",
-                    generation_options=LlmGenerationOptions(
-                        temperature=0,
-                        max_tokens=int(os.environ.get("ASAP_STAGED_LLM_MAX_TOKENS", "512")),
-                    ),
-                )
-            )
-            parsed = _extract_json(resp.generatedText)
-        except Exception:  # noqa: BLE001
-            return []
-        valid = {r["code"] for r in ranked}
-        picked = [str(c) for c in (parsed.get("selected") or []) if str(c) in valid]
-        return picked[: self.keep_per_level]
-
     def _select_keep(self, ranked: list[dict[str, Any]]) -> list[str]:
-        """현행 이산 top-k. (구 _llm_select — LLM re-selector는 2026-07-22
-        설계자 지시로 폐기: 임시 실험 잔재였고 런타임 LLM 0 mandate 위반.)"""
+        """결정론적 점수 순위에서 단계별 상위 후보를 유지한다."""
         if not ranked:
             return []
         return [r["code"] for r in ranked[: self.keep_per_level]]

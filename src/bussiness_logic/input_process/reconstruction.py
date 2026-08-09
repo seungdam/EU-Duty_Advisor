@@ -33,6 +33,7 @@ from bussiness_logic.product.ocr.ocr_normalization import (
     ProductOcrFactNormalizer,
 )
 from bussiness_logic.utils import NormalizeWhiteSpace, NormalizeWhitespaceLines
+from bussiness_logic.utils.json_files import WriteJsonAtomically
 from bussiness_logic.utils.json_types import JsonObject
 
 
@@ -2558,11 +2559,7 @@ class ProductFactReconstructionAgent:
         productId = ExtractProductIdFromUrl(evidencePackage.productPageUrl)
         artifactDirectory = self._artifactRootPath / productId
         try:
-            artifactDirectory.mkdir(parents=True, exist_ok=True)
-            (artifactDirectory / fileName).write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            WriteJsonAtomically(artifactDirectory / fileName, payload)
         except OSError:
             return
 

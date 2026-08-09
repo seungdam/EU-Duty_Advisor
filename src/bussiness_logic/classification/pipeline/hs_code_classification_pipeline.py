@@ -41,12 +41,10 @@ class HsCodeClassificationPipeline:
         *,
         identityHintRuntimeAdapter: object | None = None,
         routingRuntimeAdapter: object | None = None,
-        selectionRuntimeAdapter: object | None = None,
         validationRuntimeAdapter: object | None = None,
     ) -> None:
         self._identityHintRuntimeAdapter = identityHintRuntimeAdapter
         self._routingRuntimeAdapter = routingRuntimeAdapter
-        self._selectionRuntimeAdapter = selectionRuntimeAdapter
         self._validationRuntimeAdapter = validationRuntimeAdapter
 
     def Run(self, context: PipelineContext) -> None:
@@ -83,7 +81,6 @@ class HsCodeClassificationPipeline:
             PipelineStep(
                 "classification",
                 ClassificationComponent(
-                    selectionRuntimeAdapter=self._selectionRuntimeAdapter,
                     validationRuntimeAdapter=self._validationRuntimeAdapter,
                 ),
             ),
