@@ -1,3 +1,8 @@
+"""Legacy exploration; excluded from the CI pytest suite.
+
+It depends on the removed ``DB.experiment_canonical_binding_canary`` prototype.
+"""
+
 from __future__ import annotations
 
 import pytest
