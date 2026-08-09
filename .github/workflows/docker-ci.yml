@@ -13,6 +13,9 @@ on:
       - "webapp/**"
       - "asap_app.py"
       - "config/**"
+      - ".github/workflows/docker-ci.yml"
+      - "docs"
+      - ".gitmodules"
 
   workflow_dispatch:
 
