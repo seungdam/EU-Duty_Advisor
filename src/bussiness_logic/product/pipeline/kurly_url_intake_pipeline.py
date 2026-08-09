@@ -298,6 +298,7 @@ class KurlyUrlIntakePipeline:
             downloadTimeoutSeconds=pipelineInput.downloadTimeoutSeconds,
             reuseArtifactImages=pipelineInput.reuseOcrImageArtifacts,
             imageStatusCallback=imageStatusCallback,
+            runId=pipelineInput.runId,
         )
         errors.extend(
             imageResult.error

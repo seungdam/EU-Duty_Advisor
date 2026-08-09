@@ -15,6 +15,7 @@ from bussiness_logic.product.ocr.ocr_execution import (
 from bussiness_logic.product.ocr.download_execution import (
     DownloadExecutionCoordinator,
 )
+from bussiness_logic.utils.json_files import WriteJsonAtomically
 from bussiness_logic.utils.json_types import JsonObject
 
 if TYPE_CHECKING:
@@ -173,14 +174,8 @@ def BuildKurlyUrlFactsFromPipelineResult(
     }
     productInputArtifactPath = productArtifactDirectory / "product-input.json"
     if write_product_input_artifact:
-        productArtifactDirectory.mkdir(parents=True, exist_ok=True)
         facts["url_intake"]["product_input_artifact"] = str(productInputArtifactPath)
-        temporaryArtifactPath = productInputArtifactPath.with_suffix(".json.tmp")
-        temporaryArtifactPath.write_text(
-            json.dumps(facts, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporaryArtifactPath.replace(productInputArtifactPath)
+        WriteJsonAtomically(productInputArtifactPath, facts)
     return facts
 
 
@@ -193,6 +188,7 @@ def CollectKurlyUrlFacts(
     scroll_count: int | None = None,
     max_ocr_images: int | None = None,
     imageStatusCallback: Callable[[list[JsonObject]], None] | None = None,
+    runId: str | None = None,
 ) -> JsonObject:
     """Collect product facts from a Kurly product URL.
 
@@ -280,6 +276,7 @@ def CollectKurlyUrlFacts(
     artifact_root.mkdir(parents=True, exist_ok=True)
     pipelineInput = KurlyUrlIntakeInput(
         productPageUrl=url,
+        runId=runId,
         runOcrFallback=run_ocr,
         artifactRootPath=artifact_root,
         maxOcrImageCount=max_ocr_images,

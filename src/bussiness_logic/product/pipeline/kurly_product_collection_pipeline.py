@@ -33,6 +33,7 @@ class KurlyProductCollectionPipeline:
         context.facts = CollectKurlyProductFactsIfNeeded(
             facts=context.facts,
             imageStatusCallback=EmitImageStatus,
+            runId=context.store.run_id,
         )
         changed = context.facts != previousFacts
         context.Emit(

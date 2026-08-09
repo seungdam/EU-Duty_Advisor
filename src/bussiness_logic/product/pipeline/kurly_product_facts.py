@@ -12,6 +12,7 @@ def CollectKurlyProductFactsIfNeeded(
     *,
     facts: JsonObject,
     imageStatusCallback: Callable[[list[JsonObject]], None] | None = None,
+    runId: str | None = None,
 ) -> JsonObject:
     """Collect Kurly product facts when the normalized input only has a URL."""
     normalizedFacts = NormalizeProductFacts(facts or {})
@@ -34,6 +35,7 @@ def CollectKurlyProductFactsIfNeeded(
             collected = CollectKurlyUrlFacts(
                 url,
                 imageStatusCallback=imageStatusCallback,
+                runId=runId,
             )
             merged = dict(normalizedFacts)
             for key, value in collected.items():

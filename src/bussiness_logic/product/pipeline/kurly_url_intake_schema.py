@@ -24,6 +24,7 @@ class KurlyUrlIntakeInput(BaseModel):
     model_config = ConfigDict(populate_by_name=True, frozen=True)
 
     productPageUrl: str
+    runId: Optional[str] = Field(default=None, alias="run_id")
     runOcrFallback: bool = False
     artifactRootPath: Path = DEFAULT_PRODUCT_OCR_IMAGE_ARTIFACT_ROOT_PATH
     maxOcrImageCount: int = Field(

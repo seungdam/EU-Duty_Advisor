@@ -13,7 +13,10 @@ from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from bussiness_logic.artifact_paths import ExtractProductIdFromUrl
+from bussiness_logic.artifact_paths import (
+    BuildSafeArtifactPathSegment,
+    ExtractProductIdFromUrl,
+)
 from bussiness_logic.product.ocr.download_execution import (
     DownloadExecutionCoordinator,
     SHARED_DOWNLOAD_EXECUTION_COORDINATOR,
@@ -202,10 +205,12 @@ class ProductOcrArtifactStore:
         artifactRootPath: Path,
         productPageUrl: str,
         preserveInputImages: bool = False,
+        runId: str | None = None,
     ) -> Path:
         artifactDirectory = self._BuildArtifactDirectory(
             artifactRootPath,
             productPageUrl,
+            runId,
         )
         artifactDirectory.mkdir(parents=True, exist_ok=True)
         for artifactPath in artifactDirectory.glob("ocr-fallback-image-*"):
@@ -366,8 +371,17 @@ class ProductOcrArtifactStore:
         self,
         artifactRootPath: Path,
         productPageUrl: str,
+        runId: str | None = None,
     ) -> Path:
-        return artifactRootPath / ExtractProductIdFromUrl(productPageUrl)
+        productDirectory = artifactRootPath / ExtractProductIdFromUrl(
+            productPageUrl
+        )
+        if runId is None:
+            return productDirectory
+        safeRunId = BuildSafeArtifactPathSegment(runId, fallback="")
+        if not runId or safeRunId != runId:
+            raise ValueError("runId must be a safe artifact path segment")
+        return productDirectory / "runs" / safeRunId
 
     def _BuildImageFileName(self, imageIndex: int, imageUrl: str) -> str:
         parsedUrl = urlparse(imageUrl)
@@ -445,11 +459,13 @@ class ProductOcrFallbackRunner:
         downloadTimeoutSeconds: int,
         reuseArtifactImages: bool = False,
         imageStatusCallback: OcrImageStatusCallback | None = None,
+        runId: str | None = None,
     ) -> List[ProductOcrImageResult]:
         artifactDirectory = self._artifactStore.PrepareArtifactDirectory(
             artifactRootPath=artifactRootPath,
             productPageUrl=productPageUrl,
             preserveInputImages=reuseArtifactImages,
+            runId=runId,
         )
 
         selectedImageUrls = imageUrls[: max(0, maxImageCount)]
