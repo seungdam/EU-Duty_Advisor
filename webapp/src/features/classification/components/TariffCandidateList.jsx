@@ -1,16 +1,12 @@
 import { CheckCircle2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { candidateKey, clean, optionalFiniteNumber } from "@/lib/format.js";
+import { candidateKey, clean } from "@/lib/format.js";
 
 function CandidateRationale(candidate) {
   const text = clean(candidate?.classification_basis?.[0]);
   return text
     .replace(/^Staged narrowing hs4->hs6->cn8 selected CN8=/, "HS4 → HS6 → CN8 단계 축소: ")
     .replaceAll("_", " ") || "상세 판단 메모를 확인하세요.";
-}
-
-function RelativeScore(candidate) {
-  return optionalFiniteNumber(candidate?.candidate_static_tree?.total_score);
 }
 
 function UnresolvedCount(candidate) {
@@ -43,7 +39,6 @@ export default function TariffCandidateList({ candidates, selectedKey, onSelect 
         {candidates.map((candidate, index) => {
           const key = candidateKey(candidate, index);
           const active = key === activeKey;
-          const score = candidates.length > 1 ? RelativeScore(candidate) : null;
           const unresolved = UnresolvedCount(candidate);
           return (
             <button
@@ -58,7 +53,6 @@ export default function TariffCandidateList({ candidates, selectedKey, onSelect 
                   <strong className="text-sm">{candidate.rank || index + 1}순위</strong>
                   {candidate.llm_recommended ? <Badge className="gap-1"><CheckCircle2 /> 시스템 추천</Badge> : null}
                 </span>
-                {score !== null ? <span className="text-xs font-semibold text-primary">단계 비교값 {score}</span> : null}
               </span>
               <span className="mt-2 grid grid-cols-3 gap-2 text-xs">
                 <span><em className="block not-italic text-muted-foreground">HS6</em><b className="font-mono">{clean(candidate.hs6) || "-"}</b></span>

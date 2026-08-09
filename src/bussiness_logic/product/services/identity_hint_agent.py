@@ -20,6 +20,14 @@ from bussiness_logic.product.model.product_understanding import (
     DistilledIdentityFacts,
     EncyclopediaEvidenceSet,
 )
+from bussiness_logic.product.services.identity_hint_guard import (
+    BuildIdentityGuardEvidence,
+    BuildIdentityGuardPromptBlock,
+    CacheIdentityHintCandidate,
+    GetCachedIdentityHintCandidate,
+    ValidateIdentityHintCandidate,
+)
+
 
 # [WCO 21부 · 07-23 설계자 지시] 도메인 힌트를 임의 6분류에서 **HS협약
 # 공식 21부(Section I~XXI)**로 재작성 — 문서 근거(WCO Nomenclature 부
@@ -314,26 +322,31 @@ def _compact_evidence(
     distilledIdentity: DistilledIdentityFacts,
     encyclopediaEvidence: EncyclopediaEvidenceSet,
     factTexts: tuple[str, ...] = (),
+    acceptedEncyclopediaTitles: tuple[str, ...] | None = None,
+    normalizedCoiBlock: str = "",
 ) -> str:
     # [축질문 재설계 · 07-23] 백과 = **표제만**(본문·요약·스니펫 폐지 —
     # 타요/탐폰 계보의 본문 오염 원천 차단, "본문은 오염원·제목만" 실측
     # 원칙의 공급 시점 적용). 약 등급 불승선은 유지.
-    _has_strong = any(
-        str(getattr(e, "grade", "") or "") == "strong"
-        for e in encyclopediaEvidence.entries)
-    _boarded = [
-        e for e in encyclopediaEvidence.entries
-        if str(getattr(e, "grade", "") or "") != "weak"
-        and not (_has_strong
-                 and str(getattr(e, "grade", "") or "") == "medium")
-    ][:3]
-    _titles = [
-        str(e.title).strip() for e in _boarded if str(e.title).strip()
-    ]
-    for _t in (distilledIdentity.sourceTitles or ()):
-        _t = str(_t).strip()
-        if _t and _t not in _titles:
-            _titles.append(_t)
+    if acceptedEncyclopediaTitles is None:
+        _has_strong = any(
+            str(getattr(e, "grade", "") or "") == "strong"
+            for e in encyclopediaEvidence.entries)
+        _boarded = [
+            e for e in encyclopediaEvidence.entries
+            if str(getattr(e, "grade", "") or "") != "weak"
+            and not (_has_strong
+                     and str(getattr(e, "grade", "") or "") == "medium")
+        ][:3]
+        _titles = [
+            str(e.title).strip() for e in _boarded if str(e.title).strip()
+        ]
+        for _t in (distilledIdentity.sourceTitles or ()):
+            _t = str(_t).strip()
+            if _t and _t not in _titles:
+                _titles.append(_t)
+    else:
+        _titles = list(acceptedEncyclopediaTitles)
     encyc = "\n".join(f"- {t}" for t in _titles[:5])
     # [축질문 재설계] 라벨 = 1급 증거 — 기본 ON으로 반전(종전 기본 OFF가
     # "최고 권위 증거를 LLM에 숨기던" 정보 절단이었음, 설계자 확정).
@@ -345,6 +358,7 @@ def _compact_evidence(
     return (
         f"product_name: {productName}\n"
         f"encyclopedia_titles:\n{encyc or '-'}"
+        f"{chr(10) + chr(10) + normalizedCoiBlock if normalizedCoiBlock else ''}"
         f"{label_block}"
     )
 
@@ -430,11 +444,29 @@ def _BuildIdentityFacts(
     tokens = max_tokens if max_tokens is not None else int(
         os.environ.get("ASAP_PRODUCT_UNDERSTANDING_MAX_TOKENS", "4096")
     )
+    guardEnabled = (
+        os.environ.get("ASAP_IDENTITY_HINT_GUARD", "0") or "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    guardEvidence = (
+        BuildIdentityGuardEvidence(
+            productName=productName,
+            factTexts=factTexts,
+            encyclopediaEvidence=encyclopediaEvidence,
+        )
+        if guardEnabled
+        else None
+    )
     user_prompt = _compact_evidence(
         productName=productName,
         distilledIdentity=distilledIdentity,
         encyclopediaEvidence=encyclopediaEvidence,
         factTexts=factTexts,
+        acceptedEncyclopediaTitles=(
+            guardEvidence.acceptedEncyclopediaTitles if guardEvidence else None
+        ),
+        normalizedCoiBlock=(
+            BuildIdentityGuardPromptBlock(guardEvidence) if guardEvidence else ""
+        ),
     )
     chapter_context = _chapter_context()
     if chapter_context:
@@ -442,10 +474,16 @@ def _BuildIdentityFacts(
     # 빈/무효 응답은 1회 재시도 — US_KR name-only 실측에서 실패 10건 중
     # 8건이 empty_or_invalid_json(복불복)이었다. 실패 시 원문 앞부분을
     # llm_error에 남겨 '무엇이 왔는지'를 사후 판독 가능하게 한다.
-    parsed: dict[str, object] = {}
+    parsed = (
+        GetCachedIdentityHintCandidate(guardEvidence.evidenceHash) or {}
+        if guardEvidence
+        else {}
+    )
+    cacheHit = bool(parsed)
+    cachedGuardReasons = tuple(parsed.pop("_identity_guard_reasons", ()))
     raw_text = ""
     last_error = ""
-    for attempt in range(2):
+    for attempt in range(0 if cacheHit else 2):
         try:
             response = runtimeAdapter.Generate(
                 LlmRequest(
@@ -470,6 +508,22 @@ def _BuildIdentityFacts(
                 if not last_error else f"{last_error} (retried)"
             ),
         }
+
+    guardReasons: tuple[str, ...] = ()
+    guardHash = ""
+    guardNeedsReview = bool(parsed.get("needs_review"))
+    if guardEvidence:
+        guardResult = ValidateIdentityHintCandidate(
+            parsed=parsed,
+            evidence=guardEvidence,
+        )
+        parsed = guardResult.candidate
+        guardReasons = cachedGuardReasons or guardResult.reasons
+        guardHash = guardResult.evidenceHash
+        guardNeedsReview = guardResult.needsReview
+        cachePayload = dict(parsed)
+        cachePayload["_identity_guard_reasons"] = list(guardReasons)
+        CacheIdentityHintCandidate(guardEvidence.evidenceHash, cachePayload)
 
     # [축질문 매핑 · 07-23 설계자 승인] 6질문 답 → 기존 IdentityHintSet
     # 필드(하류 계약 보존). 자유작문 필드는 전부 코드 조립으로 대체 —
@@ -519,11 +573,22 @@ def _BuildIdentityFacts(
         "chapter_hint_terms": hint_terms,
         "chapter_hint_source_terms": _dedup_strings([head, principal], limit=8),
         "chapter_hint_basis": (
-            "axis_questions" if hint_terms else "axis_questions_empty"
-        ),
+            (
+                f"axis_questions_guarded:{guardHash[:12]}"
+                if guardEnabled
+                else "axis_questions"
+            )
+            if hint_terms
+            else (
+                "axis_questions_guarded_empty"
+                if guardEnabled
+                else "axis_questions_empty"
+            )),
         "chapter_hint_status": "enabled" if hint_terms else "not_enabled",
         "confidence": confidence,
-        "needs_review": bool(parsed.get("needs_review")),
+        "needs_review": guardNeedsReview,
+        "conflict_reason": "; ".join(guardReasons)[:600],
+        "identity_guard_hash": guardHash,
         "understanding_mode": "llm_json",
         "llm_error": "",
     }

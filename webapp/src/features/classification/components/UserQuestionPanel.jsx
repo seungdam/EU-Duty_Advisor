@@ -27,8 +27,20 @@ export default function UserQuestionPanel({
     }));
 
   useEffect(() => {
-    setAnswers({});
-    setCurrentIndex(0);
+    setAnswers((current) => {
+      const next = {};
+      questions.forEach((question) => {
+        const answer = current[question.user_question_id] || question.answer;
+        if (["yes", "no", "unknown"].includes(answer)) {
+          next[question.user_question_id] = answer;
+        }
+      });
+      return next;
+    });
+    const firstUnanswered = questions.findIndex(
+      (question) => !["yes", "no", "unknown"].includes(question.answer),
+    );
+    setCurrentIndex(firstUnanswered >= 0 ? firstUnanswered : 0);
     setDirection(1);
   }, [questionKey]);
 
@@ -42,6 +54,20 @@ export default function UserQuestionPanel({
   };
   const activeQuestionId = activeQuestion.user_question_id;
   const selectedAnswer = answers[activeQuestionId];
+  const SelectAnswer = (answer) => {
+    setAnswers((current) => ({
+      ...current,
+      [activeQuestionId]: answer,
+    }));
+    const nextUnansweredIndex = questions.findIndex(
+      (question, index) => index > safeIndex
+        && !answers[question.user_question_id],
+    );
+    if (nextUnansweredIndex >= 0) {
+      setDirection(1);
+      setCurrentIndex(nextUnansweredIndex);
+    }
+  };
 
   return (
     <Card className="overflow-hidden border-warning/45 bg-warning/5">
@@ -117,7 +143,7 @@ export default function UserQuestionPanel({
                   variant={selectedAnswer === "yes" ? "default" : "outline"}
                   aria-pressed={selectedAnswer === "yes"}
                   disabled={submitting}
-                  onClick={() => setAnswers((current) => ({ ...current, [activeQuestionId]: "yes" }))}
+                  onClick={() => SelectAnswer("yes")}
                 >
                   예
                 </Button>
@@ -127,7 +153,7 @@ export default function UserQuestionPanel({
                   variant={selectedAnswer === "no" ? "default" : "outline"}
                   aria-pressed={selectedAnswer === "no"}
                   disabled={submitting}
-                  onClick={() => setAnswers((current) => ({ ...current, [activeQuestionId]: "no" }))}
+                  onClick={() => SelectAnswer("no")}
                 >
                   아니오
                 </Button>

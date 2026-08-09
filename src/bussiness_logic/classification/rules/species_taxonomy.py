@@ -118,6 +118,19 @@ class ExactSpeciesTaxonomy:
         self._ancestorCache[concept] = result
         return result
 
+    def MostSpecific(self, concepts: Iterable[str]) -> set[str]:
+        """Drop a concept when a detected descendant carries more precision."""
+        selected = set(concepts)
+        return {
+            concept
+            for concept in selected
+            if not any(
+                concept in self.Ancestors(other)
+                for other in selected
+                if other != concept
+            )
+        }
+
     def Resolve(self, values: Iterable[Any]) -> tuple[set[str], list[str]]:
         concepts: set[str] = set()
         unknown: list[str] = []
@@ -160,6 +173,8 @@ class ExactSpeciesTaxonomy:
         factTexts = [text for value in factValues for text in _texts(value)]
         questionConcepts, unknownQuestions = self.Resolve(questionTexts)
         factConcepts, unknownFacts = self.Resolve(factTexts)
+        questionConcepts = self.MostSpecific(questionConcepts)
+        factConcepts = self.MostSpecific(factConcepts)
 
         # Exact phrase equality is still a valid named-species answer even
         # when the curated hierarchy has not learned that species yet.

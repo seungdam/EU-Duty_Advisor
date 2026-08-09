@@ -106,7 +106,33 @@ INGREDIENT_TERM_ALIASES = (
 )
 PROCESSING_STATE_RULES = (
     ("frozen", ("냉동", "-18", "frozen")),
-    ("cooked", ("가열하여 섭취", "유탕", "볶음", "조리", "cooked", "boiled", "fried", "roasted", "steamed")),
+    (
+        "requires_cooking",
+        (
+            "가열하여 섭취",
+            "가열 후 섭취",
+            "조리하여 섭취",
+            "cook before eating",
+            "requires cooking",
+            "heat before consumption",
+        ),
+    ),
+    (
+        "cooked",
+        (
+            "유탕",
+            "볶음",
+            "삶은",
+            "구운",
+            "찐",
+            "조리완료",
+            "cooked",
+            "boiled",
+            "fried",
+            "roasted",
+            "steamed",
+        ),
+    ),
     ("fermented", ("발효", "김치", "fermented")),
     ("dried", ("건조", "dried")),
     ("chilled", ("냉장", "chilled")),
@@ -1052,12 +1078,25 @@ class ProductUnderstandingComponent(BasePipelineComponent):
         states: list[str] = []
         for stateName, terms in PROCESSING_STATE_RULES:
             if any(
-                ProductUnderstandingComponent._ContainsTerm(text, term)
+                ProductUnderstandingComponent._ContainsProcessingTerm(text, term)
                 for text in factTexts
                 for term in terms
             ):
                 states.append(stateName)
         return " ".join(states[:4]) if states else "unknown"
+
+    @staticmethod
+    def _ContainsProcessingTerm(text: str, term: str) -> bool:
+        source = str(text or "").lower()
+        target = str(term or "").lower()
+        if not source or not target:
+            return False
+        if re.fullmatch(r"[a-z][a-z ]*", target):
+            return re.search(
+                rf"(?<![a-z]){re.escape(target)}(?![a-z])",
+                source,
+            ) is not None
+        return target in source
 
     @staticmethod
     def _IngredientTermAliases(term: str) -> tuple[str, ...]:

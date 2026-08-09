@@ -164,6 +164,17 @@ export default function WorkbenchPage() {
     return snapshot;
   };
 
+  const SubmitQuestionAnswers = async (answers) => {
+    const snapshot = await answerQuestions(answers);
+    if (snapshot) {
+      followStageRef.current = false;
+      followClassificationRef.current = false;
+      setActiveStage("classification");
+      setClassificationStep("hierarchy");
+    }
+    return snapshot;
+  };
+
   const resultStatus = clean(result?.job_status).toLowerCase();
   const hasRun = Boolean(
     clean(result?.job_id)
@@ -250,7 +261,7 @@ export default function WorkbenchPage() {
                       <UserQuestionPanel
                         key={resultJobId}
                         questions={activeQuestions}
-                        onSubmit={answerQuestions}
+                        onSubmit={SubmitQuestionAnswers}
                         submitting={answering}
                         error={answerError}
                       />
@@ -260,6 +271,7 @@ export default function WorkbenchPage() {
                         candidates={viewModel.candidates}
                         selectedPath={viewModel.candidateSet.selected_path}
                         selectedCn8={selectedCandidate?.cn8 || defaultCandidate?.cn8}
+                        trace={trace}
                       />
                     ) : null}
                   </>

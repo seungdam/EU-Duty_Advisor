@@ -14,8 +14,9 @@ import {
   trueDetails,
   verdictLabel,
 } from "@/lib/traceContract.js";
+import DataTable from "@/components/DataTable";
 import { BuildCandidateHierarchy, UnderstandingValueLabel } from "@/lib/labels.js";
-import { asList, asObject, clean, optionalFiniteNumber } from "@/lib/format.js";
+import { asList, asObject, clean } from "@/lib/format.js";
 import { PrecedentSummary } from "./EvidenceElements";
 
 function EvidenceGradeBadge({ detail }) {
@@ -178,7 +179,7 @@ function ClassificationBasisLabel(value) {
   return basis.replaceAll("_", " ");
 }
 
-function ClassificationHierarchyNode({ node, selectedCn8, showScores }) {
+function ClassificationHierarchyNode({ node, selectedCn8 }) {
   const children = asList(node.children);
   const description = ClassificationBasisLabel(node.description);
   const selected = node.level === "CN8" && clean(node.code) === clean(selectedCn8);
@@ -191,9 +192,6 @@ function ClassificationHierarchyNode({ node, selectedCn8, showScores }) {
           <small>
             {description || `${node.level} ${node.code}의 공식 품목 설명이 결과에 포함되지 않았습니다.`}
           </small>
-          <div className="cjs-hierarchy-meta">
-            {showScores && optionalFiniteNumber(node.score) !== null ? <small>단계 비교값 {node.score}</small> : null}
-          </div>
         </div>
       </div>
       {children.length ? (
@@ -202,7 +200,6 @@ function ClassificationHierarchyNode({ node, selectedCn8, showScores }) {
             <ClassificationHierarchyNode
               node={child}
               selectedCn8={selectedCn8}
-              showScores={showScores}
               key={`${child.level}-${child.code}`}
             />
           ))}
@@ -212,7 +209,72 @@ function ClassificationHierarchyNode({ node, selectedCn8, showScores }) {
   );
 }
 
-export function ClassificationHierarchy({ candidates, selectedPath, selectedCn8 }) {
+function StageCandidateComparison({ trace }) {
+  const stages = asList(trace?.stages)
+    .filter((stage) => ["hs4", "hs6"].includes(clean(asObject(stage).stage).toLowerCase()))
+    .map((stage) => {
+      const source = asObject(stage);
+      const selected = new Set(asList(source.selected_codes).map(clean).filter(Boolean));
+      const considered = asList(source.candidates_considered)
+        .map(asObject)
+        .filter((candidate) => clean(candidate.code));
+      const priority = (candidate) => {
+        if (selected.has(clean(candidate.code))) return 0;
+        if (clean(candidate.decision) === "confirmed") return 1;
+        if (clean(candidate.decision) === "undecided") return 2;
+        if (clean(candidate.decision) === "violated") return 4;
+        return 3;
+      };
+      const rows = considered
+        .map((candidate, index) => ({ candidate, index }))
+        .sort((left, right) => (
+          priority(left.candidate) - priority(right.candidate)
+          || left.index - right.index
+        ))
+        .slice(0, 3)
+        .map(({ candidate }) => ({
+          selected: selected.has(clean(candidate.code)),
+          code: clean(candidate.code),
+          description: clean(candidate.description)
+            || "공식 품목 설명이 trace에 기록되지 않았습니다.",
+          decision: decisionLabel(candidate.decision),
+        }));
+      return {
+        stage: clean(source.stage).toLowerCase(),
+        rows,
+      };
+    })
+    .filter((stage) => stage.rows.length);
+
+  if (!stages.length) return null;
+  return (
+    <div className="mt-5 grid gap-4">
+      <div>
+        <div className="cjs-subpanel-title">단계별 후보 비교</div>
+        <div className="cjs-muted">
+          True는 이 단계에서 선택된 코드이며, False는 함께 검토된 대안입니다.
+        </div>
+      </div>
+      {stages.map((stage) => (
+        <div className="grid gap-2" key={stage.stage}>
+          <strong className="text-sm">{stageLabelKo(stage.stage)}</strong>
+          <DataTable
+            rows={stage.rows}
+            limit={3}
+            columns={[
+              { key: "selected", label: "선택", variant: "pill" },
+              { key: "code", label: "코드", variant: "mono" },
+              { key: "description", label: "분류표 설명" },
+              { key: "decision", label: "판정 상태" },
+            ]}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function ClassificationHierarchy({ candidates, selectedPath, selectedCn8, trace }) {
   const tree = BuildCandidateHierarchy(candidates, asObject(selectedPath));
   const hasCandidates = asList(tree.children).length > 0;
   return (
@@ -229,15 +291,12 @@ export function ClassificationHierarchy({ candidates, selectedPath, selectedCn8 
           <ClassificationHierarchyNode
             node={tree}
             selectedCn8={selectedCn8}
-            showScores={candidates.length > 1}
           />
         </ul>
       ) : (
         <div className="cjs-muted">계층 분류 후보가 기록되지 않았습니다.</div>
       )}
-      <div className="cjs-muted">
-        단계 비교값은 각 단계 내부의 후보 비교 기록이며 확률 또는 법적 확신도가 아닙니다.
-      </div>
+      <StageCandidateComparison trace={trace} />
     </div>
   );
 }

@@ -69,6 +69,22 @@ def NormalizeClassificationAnswer(value: Any) -> str:
     return normalized if normalized in VALID_ANSWERS else ""
 
 
+def ResolveQuestionCandidateCode(
+    detail: Mapping[str, Any],
+    *,
+    parentCode: str,
+    candidateCode: str,
+    contextScope: str,
+) -> str:
+    """Use one stable answer key for a context repeated across sibling leaves."""
+    if (
+        str(contextScope or "").strip()
+        and str(detail.get("context_scope") or "").strip()
+    ):
+        return str(parentCode or "").strip()
+    return str(candidateCode or "").strip()
+
+
 def FindClassificationAnswer(
     productFacts: Mapping[str, Any],
     *,
@@ -107,10 +123,16 @@ def _detail_contract(
         canonicalField = str(detail.get("binding_paths") or "").split(";", 1)[0].strip()
     conditionValue = detail.get("value")
     predicateOp = str(detail.get("op") or "").strip().lower() or "affirmative"
+    questionCandidateCode = ResolveQuestionCandidateCode(
+        detail,
+        parentCode=parentCode,
+        candidateCode=candidateCode,
+        contextScope=contextScope,
+    )
     questionKey = BuildClassificationQuestionKey(
         stage=stage,
         parentCode=parentCode,
-        candidateCode=candidateCode,
+        candidateCode=questionCandidateCode,
         axis=axis,
         canonicalField=canonicalField,
         conditionValue=conditionValue,

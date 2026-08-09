@@ -123,6 +123,16 @@ _FORM_POLARITY_EQUIVALENTS = {
     "stuffed": frozenset({"stuffed", "filled"}),
     "filled": frozenset({"stuffed", "filled"}),
 }
+_PROCESSING_POLARITY = {
+    "uncooked": (
+        frozenset({"uncooked", "requires_cooking"}),
+        frozenset({"cooked"}),
+    ),
+    "cooked": (
+        frozenset({"cooked"}),
+        frozenset({"uncooked", "requires_cooking"}),
+    ),
+}
 _WRAPPER_FIELD = "composition_facts.contains_wrapper_or_dough"
 
 
@@ -255,6 +265,41 @@ def MatchHasTokenPolarity(
         for value in values
         for token in _TOKEN.findall(str(value).lower())
     }
+    processing_fields = {
+        path.strip().rsplit(".", 1)[-1]
+        for path in dto_field.split(";")
+        if path.strip()
+    }
+    processing_queries = query_tokens & _PROCESSING_POLARITY.keys()
+    if processing_queries and "processing_state" in processing_fields:
+        state_tokens = _field_tokens(product_facts, dto_field)
+        positive_states: set[str] = set()
+        negative_states: set[str] = set()
+        for query in processing_queries:
+            positives, negatives = _PROCESSING_POLARITY[query]
+            positive_states.update(positives)
+            negative_states.update(negatives)
+
+        requires_cooking = (
+            "requires_cooking" in state_tokens
+            or {"require", "cooking"} <= state_tokens
+        )
+        positive = bool(state_tokens & positive_states) or (
+            requires_cooking and "requires_cooking" in positive_states
+        )
+        negative = bool(state_tokens & negative_states) or (
+            requires_cooking and "requires_cooking" in negative_states
+        )
+        if positive and negative:
+            return "unknown", "processing_state_conflict"
+        if positive:
+            return "true", "processing_state_equivalent"
+        if negative:
+            return "false", "processing_state_opposite"
+        if state_tokens:
+            return "unknown", "processing_state_unresolved"
+        return None, ""
+
     concept_terms: set[str] = set()
     for token in query_tokens:
         concept_terms.update(_FORM_POLARITY_EQUIVALENTS.get(token, ()))
@@ -464,14 +509,14 @@ def EvaluatePredicates(
                 for phrase in phrases if phrase
             ]
             hit = any(matched for matched, _ in matches)
-            bound = (
-                _field_tokens(product_facts, dto_field)
-                if dto_field != "*tokens*"
-                else set()
-            )
+            explicit_negative = bool(matches) and all(
+                reason == "explicit_negation_guarded"
+                for matched, reason in matches
+                if not matched
+            ) and not any(matched for matched, _ in matches)
             if hit:
                 verdict = "false"
-            elif closed_world and bound:
+            elif explicit_negative:
                 verdict = "true"
             else:
                 verdict = "unknown"
@@ -514,7 +559,7 @@ def EvaluatePredicates(
         why = ""
         if op == "not_contains" and not hit:
             if verdict == "true":
-                why = "canonical_field_absence"
+                why = "explicit_negation"
             else:
                 guarded = [reason for matched, reason in matches
                            if not matched and reason not in {"phrase_absent"}]

@@ -44,7 +44,7 @@ export default function DocumentRecommendationPanel({ result, viewModel, selecte
       </div>
       {packages.length ? (
         <div className="divide-y">
-          {packages.map(({ taric, group, matchLevel }, index) => {
+          {displayPackages.map(({ taric, group, matchLevel }) => {
             const summary = PackageSummary(group);
             const branchIndex = Number(asObject(asList(group)[0]).taric10_branch_index) || index + 1;
             return (

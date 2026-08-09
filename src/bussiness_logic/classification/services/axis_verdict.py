@@ -1,13 +1,14 @@
-"""HS4/HS6 axis verdict runtime.
+"""HS4/HS6/CN8 axis verdict runtime.
 
 DB/redesign_hs4.py(오프라인 실험)의 판정핵을 런타임으로 이식한 것. 병립
 선택기를 새로 만들지 않는다 — 이 모듈은 ranked 엔트리에 **verdict를 찍을
 뿐**이고, 선택은 기존 `_decide_ifelse`(이산 캐스케이드) + `_ApplyGri3Law`
 (법정 GRI3)가 소비한다 = 런타임 권위 단일화.
 
-HS4와 HS6는 DTO projection primitives만 공유한다. 공개 진입점과 축맵은
+HS4·HS6·CN8은 DTO projection primitives만 공유한다. 공개 진입점과 축맵은
 각각 `StampHs4AxisVerdicts`/`heading_axis_map`,
-`StampHs6AxisVerdicts`/`subheading_axis_map`으로 분리한다.
+`StampHs6AxisVerdicts`/`subheading_axis_map`,
+`StampCn8AxisVerdicts`/`cn8_axis_map`으로 분리한다.
 
 판정(스코어 0·이산):
   - 명시적 signed predicate는 broad axis보다 우선한다. FALSE는 배제,
@@ -61,6 +62,7 @@ _FORM_VOCAB = frozenset({
     "extract", "juice", "whole", "piece", "fillet", "flake", "powder",
     "paste", "granule", "block", "minced", "strip", "meal", "flour",
     "pellet", "ground", "sliced", "slice", "pearl", "grain", "sifting",
+    "stuffed",
 })
 
 _TOKEN_RE = re.compile(r"[a-z]{3,}")
@@ -102,6 +104,17 @@ def _sub_axmap() -> dict:
     return m
 
 
+_cn8_axmap_cache: list[dict] = []
+
+
+def _cn8_axmap() -> dict:
+    if _cn8_axmap_cache:
+        return _cn8_axmap_cache[0]
+    m = LoadSingletonAsset("cn8_axis_map").get("cn8") or {}
+    _cn8_axmap_cache.append(m)
+    return m
+
+
 def _hs4_axis_for(code: str) -> str:
     """Return the heading axis for one HS4 code."""
     digits = re.sub(r"\D", "", str(code or ""))
@@ -116,6 +129,19 @@ def _hs6_axis_for(code: str) -> str:
     return str(rec.get("axis") or "product_identity")
 
 
+def _cn8_axis_for(code: str) -> str:
+    """Return the CN8 axis for one eight-digit code."""
+    digits = re.sub(r"\D", "", str(code or ""))
+    rec = _cn8_axmap().get(digits[:8]) or {}
+    return str(rec.get("axis") or "product_identity")
+
+
+def GetCn8AxisRecord(code: str) -> dict:
+    """Return immutable-by-convention CN8 map metadata for runtime scoping."""
+    digits = re.sub(r"\D", "", str(code or ""))
+    return dict(_cn8_axmap().get(digits[:8]) or {})
+
+
 def ProjectDecisionRowsForAxis(
     level: str,
     code: str,
@@ -123,8 +149,8 @@ def ProjectDecisionRowsForAxis(
 ) -> tuple[str, list[dict[str, Any]]]:
     """Project fragmented compiler rows onto one canonical branch question.
 
-    HS4/HS6 each own exactly one primary axis per code. Legacy compiler output
-    can contain several condition families for the same code; reducing them as
+    HS4/HS6/CN8 each own exactly one primary axis per code. Legacy compiler
+    output can contain several condition families for the same code; reducing them as
     an implicit AND makes an affirmative species answer lose to an unrelated
     product-identity mismatch. Identity/species/material rows describe
     alternative views of the same commodity identity, so they form one OR
@@ -133,12 +159,28 @@ def ProjectDecisionRowsForAxis(
     Qualifiers are scope metadata, not the code's O/X question. They remain in
     the sidecar for audit but are not promoted to answer authority here.
     """
-    axis_for = _hs4_axis_for if level == "hs4" else _hs6_axis_for
+    axis_for = {
+        "hs4": _hs4_axis_for,
+        "hs6": _hs6_axis_for,
+        "cn8": _cn8_axis_for,
+    }.get(level)
+    if axis_for is None:
+        return "", []
     primary_axis = axis_for(code)
+    # Identity questions often need several equivalent views of the same
+    # commodity. Only an exact-species branch is narrower than that family:
+    # a generic product_identity row must not prove a species_source leaf such
+    # as "Pandalus/Crangon". Other axes retain the reviewed pre-existing OR
+    # projection until their signed-polarity conditions have equivalent
+    # canonical authority.
     allowed = (
-        _IDENTITY_AXIS_FAMILY
-        if primary_axis in _IDENTITY_AXIS_FAMILY
-        else frozenset({primary_axis})
+        frozenset({primary_axis})
+        if level in ("hs6", "cn8") and primary_axis == "species_source"
+        else (
+            _IDENTITY_AXIS_FAMILY
+            if primary_axis in _IDENTITY_AXIS_FAMILY
+            else frozenset({primary_axis})
+        )
     )
     projected: list[dict[str, Any]] = []
     for condition in conditions or []:
@@ -256,7 +298,28 @@ def _is_resid_desc(desc: str) -> bool:
     # "Other, including flours…"가 명시로 오인되던 실측.
     if d == "other" or re.match(r"^other\b", d):
         return True
-    return any(k in d for k in _NESOI)
+    # NESOI at the end of a substantive nomenclature sentence is a legal
+    # boundary, not proof that the entire code is a residual leaf. Only a
+    # bare/leading NESOI label is itself a residual branch.
+    return any(d.startswith(k) for k in _NESOI)
+
+
+def _is_level_residual(desc: str, axis: str, source_map: str) -> bool:
+    """Recognise a residual without leaking HS4 NESOI rules into CN8.
+
+    Heading-level ``exclusion_boundary`` entries such as 2106 are the
+    complement of the named headings in their chapter even though the NESOI
+    phrase appears at the end. CN8 keeps the stricter leading/bare rule until
+    its reviewed map carries an explicit residual role.
+    """
+    if _is_resid_desc(desc):
+        return True
+    normalized = str(desc or "").strip().lower()
+    return (
+        source_map == "hs4_axis_map"
+        and axis == "exclusion_boundary"
+        and any(marker in normalized for marker in _NESOI)
+    )
 
 
 def _verdict(
@@ -386,11 +449,31 @@ def _stamp_axis_verdicts(
             resid_toks |= _stemset(_toks(d0))
     stamped = 0
     for e in ranked:
-        if str(e.get("decision") or "") in ("confirmed", "violated"):
-            continue  # 법정 결정테이블 라벨이 상위 법원
         code = str(e.get("code") or "")
         desc = str(e.get("descr") or "")
         axis = axis_for(code)
+        if bool(e.get("residual")) or _is_level_residual(
+            desc,
+            axis,
+            source_map,
+        ):
+            # "Other"/NESOI is the complement of its named siblings.  It can
+            # never earn O from its inherited axis or a legacy signed row.
+            # Selection is legal only after parent/context-local elimination.
+            e["residual"] = True
+            if str(e.get("decision") or "") in {"confirmed", "violated"}:
+                e["decision"] = "undecided"
+            e.setdefault("decision_detail", []).append({
+                "cond": axis_for(str(e.get("code") or "")),
+                "op": "axis_verdict",
+                "verdict": "residual",
+                "why": f"{source_map}:complement_only",
+                "value": desc[:60],
+            })
+            stamped += 1
+            continue
+        if str(e.get("decision") or "") in ("confirmed", "violated"):
+            continue  # 법정 결정테이블 라벨이 상위 법원
         signed_verdict = _signed_predicate_authority(e)
         if signed_verdict:
             detail = {
@@ -548,3 +631,22 @@ def StampHs6AxisVerdicts(ranked: list, product_facts: dict) -> int:
         source_map="hs6_axis_map",
         map_available=bool(_sub_axmap()),
     )
+
+
+def StampCn8AxisVerdicts(ranked: list, product_facts: dict) -> int:
+    """Stamp CN8 leaves from the canonical CN8 axis map only."""
+    stamped = _stamp_axis_verdicts(
+        ranked,
+        product_facts,
+        axis_for=_cn8_axis_for,
+        source_map="cn8_axis_map",
+        map_available=bool(_cn8_axmap()),
+    )
+    axis_map = _cn8_axmap()
+    for row in ranked:
+        code = re.sub(r"\D", "", str(row.get("code") or ""))[:8]
+        record = axis_map.get(code) or {}
+        row["axis_parent_code"] = str(record.get("decision_parent_code") or "")
+        row["axis_parent_level"] = str(record.get("decision_parent_level") or "")
+        row["axis_runtime_parent"] = str(record.get("runtime_parent_code") or "")
+    return stamped

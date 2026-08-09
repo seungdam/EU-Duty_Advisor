@@ -110,8 +110,7 @@ _AXIS_BINDING_TIERS: dict[str, tuple[AxisBindingTier, ...]] = {
             "composition_facts",
             (
                 "composition_facts.principal_ingredient",
-                "composition_facts.ingredient_classes",
-                "composition_facts.ingredient_entries",
+                "composition_facts.principal_ingredient_candidates",
             ),
         ),
         AxisBindingTier(
@@ -316,6 +315,50 @@ def ResolveAxisFieldBinding(
         )
 
     questions = frozenset(str(token).strip().lower() for token in questionTokens)
+
+    # A dedicated boolean register is more specific than a populated free-text
+    # form. For "stuffed?", the wrapper field is therefore the canonical
+    # binding even when ``physical_form`` also contains "thick noodles".
+    # False remains an answer value, but the polarity evaluator still decides
+    # whether the available provenance is strong enough to conclude X.
+    boolean_paths = tuple(
+        path
+        for tier in tiers
+        for path in tier.paths
+        if (
+            (register := _BOOLEAN_REGISTER.get(path)) is not None
+            and bool(register & questions)
+            and _meaningful(_dig(productFacts, path))
+        )
+    )
+    if boolean_paths:
+        tokens: set[str] = set()
+        affirmed: set[str] = set()
+        denied: set[str] = set()
+        for path in boolean_paths:
+            register = _BOOLEAN_REGISTER[path]
+            value = _dig(productFacts, path)
+            if value is True:
+                affirmed.update(register)
+                tokens.update(register)
+            elif value is False:
+                denied.update(register)
+        return ResolvedAxisBinding(
+            axis=canonical_axis,
+            canonicalFact="physical_form_boolean",
+            sourceLane="composition_facts",
+            paths=boolean_paths,
+            tokens=frozenset(tokens),
+            values=tuple(
+                f"{path}={_summarize(_dig(productFacts, path))}"
+                for path in boolean_paths
+            ),
+            affirmedTokens=frozenset(affirmed),
+            deniedTokens=frozenset(denied),
+            status="answered",
+            tierIndex=0,
+        )
+
     fallback_paths = _relevant_paths(tiers[0].paths, questions)
     for index, tier in enumerate(tiers):
         paths = _relevant_paths(tier.paths, questions)

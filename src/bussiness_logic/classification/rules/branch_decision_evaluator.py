@@ -30,6 +30,7 @@ from bussiness_logic.classification.rules.axis_field_binding import (
     ResolveAxisFieldBinding,
 )
 from bussiness_logic.classification.rules.branch_predicate_evaluator import (
+    MatchHasTokenPolarity,
     MatchPositivePhraseEvidence,
     _aliases,
     _dig,
@@ -237,6 +238,29 @@ def EvaluateCodeDecision(
             )
             dto_field = resolved_binding.dtoField
             binding_trace = resolved_binding.ToTrace()
+        # A precedent row is retrieval evidence, not a leaf condition.  It may
+        # break a tie only inside the scoped GRI cascade after multiple
+        # candidates have independently reached O.  Letting it enter
+        # ``answers`` would allow the same BTI phrase to confirm or eliminate a
+        # candidate before GRI, including on SILENCE.
+        if str(cond.get("grade") or "").strip() == "precedent":
+            source_text = str(cond.get("source_text") or "")
+            detail.append({
+                "cond": cond_type,
+                "op": op,
+                "verdict": "skipped",
+                "field": dto_field.split(";")[0][:40],
+                "why": "precedent_reference_only",
+                "value": str(cond.get("value") or "")[:80],
+                "grade": "precedent",
+                "refs": (
+                    source_text[4:].split(",")[:4]
+                    if source_text.startswith("BTI:")
+                    else []
+                ),
+                **binding_trace,
+            })
+            continue
         # [P1-D1] qualifier(그룹 공통 자격층)는 순위 합산 불참 — true 지지도
         # violated 감점도 없다. 판별이 아니라 소속이기 때문(조상 헤더 텍스트
         # 를 형제 개별 조건으로 실었던 R5 청양고추 사고의 구조적 처방).
@@ -296,12 +320,13 @@ def EvaluateCodeDecision(
             if any(matched for matched, _ in matches):
                 verdict = "false"
                 why = "exclusion_present_in_pool"
-            elif (
-                evidence_field != "*tokens*"
-                and _field_tokens(product_facts, evidence_field)
+            elif matches and all(
+                reason == "explicit_negation_guarded"
+                for matched, reason in matches
+                if not matched
             ):
                 verdict = "true"
-                why = "canonical_field_absence"
+                why = "explicit_negation"
             else:
                 why = "exclusion_absent"
                 guarded = [reason for matched, reason in matches
@@ -410,83 +435,95 @@ def EvaluateCodeDecision(
                     **taxonomy_result.ToTrace(),
                 })
                 continue
-            # ── 극성 평가 (ASAP_DECISION_POLARITY, 기본 ON) ──
-            polarity_on = (os.environ.get(
-                "ASAP_DECISION_POLARITY", "1") or "1").strip() != "0"
-            if polarity_on:
-                all_value_toks = frozenset(tk for ph in phrases for tk in ph)
-                pol_done = False
-                # B. boolean 레지스터: False면 해당 어휘 조건 위반, True면 히트
-                for leaf, register in _BOOLEAN_REGISTER.items():
-                    if not (all_value_toks & register):
-                        continue
-                    # sauce/broth '함유'는 정체가 아니다 — 조리식품 대부분이
-                    # sauce=True라 판별력 0인데 2104(수프)의 정체 조건 'broth'
-                    # 를 확정해 비빔장을 수프로 만들었다(실측). 정체 축에서는
-                    # 이 레지스터의 승격·위반 모두 미적용(lexical 폴백).
-                    # wrapper↔stuffed는 구조=정체라 유지(190220 정답 경로).
-                    if (
-                        leaf == "contains_sauce_or_broth"
-                        and cond_type in ("product_identity", "intended_use_function")
-                    ):
-                        continue
-                    flag = _dig(product_facts, f"composition_facts.{leaf}")
-                    # wrapper 의미 분리(팀장 안건 적용): '도우로 만듦'과 '속을
-                    # 채움'은 다른 사실인데 wrapper=True가 stuffed/filled로
-                    # 직승격되어 떡이 stuffed로 읽혔다(골든 실측). True 승격은
-                    # DTO 어딘가에 채움 서술(stuff-/fill- 형태)이 실재할 때만
-                    # 허용, 없으면 레지스터를 건너뛰고 lexical 평가로 폴백.
-                    # False(위반) 쪽은 그대로 — 도우 자체가 없으면 stuffed일 수
-                    # 없다. ASAP_WRAPPER_SEMANTICS=0 구판 복귀.
-                    if (
-                        flag is True
-                        and leaf == "contains_wrapper_or_dough"
-                        and (os.environ.get("ASAP_WRAPPER_SEMANTICS", "1") or "1").strip() != "0"
-                    ):
+            # Signed polarity is baseline authority. It cannot be disabled by
+            # an environment flag because that silently restores the
+            # stuffed/cooked lexical failure mode.
+            all_value_toks = frozenset(tk for ph in phrases for tk in ph)
+            pol_done = False
+            signed_verdict, signed_why = MatchHasTokenPolarity(
+                all_value_toks,
+                product_facts,
+                _dto_eff,
+            )
+            if signed_verdict is not None:
+                verdict = {
+                    "true": "true",
+                    "false": "false",
+                    "unknown": "undecided",
+                }[signed_verdict]
+                why = signed_why
+                pol_done = True
+            # B. boolean 레지스터: False면 해당 어휘 조건 위반, True면 히트
+            for leaf, register in (() if pol_done else _BOOLEAN_REGISTER.items()):
+                if not (all_value_toks & register):
+                    continue
+                # sauce/broth '함유'는 정체가 아니다 — 조리식품 대부분이
+                # sauce=True라 판별력 0인데 2104(수프)의 정체 조건 'broth'
+                # 를 확정해 비빔장을 수프로 만들었다(실측). 정체 축에서는
+                # 이 레지스터의 승격·위반 모두 미적용(lexical 폴백).
+                # wrapper↔stuffed는 구조=정체라 유지(190220 정답 경로).
+                if (
+                    leaf == "contains_sauce_or_broth"
+                    and cond_type in ("product_identity", "intended_use_function")
+                ):
+                    continue
+                flag = _dig(product_facts, f"composition_facts.{leaf}")
+                # wrapper 의미 분리(팀장 안건 적용): '도우로 만듦'과 '속을
+                # 채움'은 다른 사실인데 wrapper=True가 stuffed/filled로
+                # 직승격되어 떡이 stuffed로 읽혔다(골든 실측). True 승격은
+                # DTO 어딘가에 채움 서술(stuff-/fill- 형태)이 실재할 때만
+                # 허용, 없으면 레지스터를 건너뛰고 lexical 평가로 폴백.
+                # False(위반) 쪽은 그대로 — 도우 자체가 없으면 stuffed일 수
+                # 없다. ASAP_WRAPPER_SEMANTICS=0 구판 복귀.
+                if (
+                    flag is True
+                    and leaf == "contains_wrapper_or_dough"
+                    and (os.environ.get("ASAP_WRAPPER_SEMANTICS", "1") or "1").strip() != "0"
+                ):
+                    corrob = _field_tokens(
+                        product_facts,
+                        "identity_hints.identity_terms;"
+                        "identity_hints.product_form_terms;"
+                        "identity_hints.normalized_tariff_description",
+                    )
+                    if not any(tk.startswith(("stuff", "fill")) for tk in corrob):
+                        break  # 레지스터 미적용 → lexical 폴백
+                if flag is True:
+                    verdict, why, pol_done = "true", f"field_hit:{leaf}", True
+                elif flag is False:
+                    # False 위반의 거울상 가드: 정체 lane이 해당 어휘를
+                    # 긍정 서술하는데 boolean만 False면 두 lane의 모순
+                    # (파서 미충전 가능성) — 위반 대신 lexical 폴백.
+                    # 실측: 군만두 wrapper=False 오충전이 identity의
+                    # 'stuffed pasta' 4증거를 -100으로 뒤집어 190219 어부지리.
+                    # 같은 ASAP_WRAPPER_SEMANTICS 게이트로 복귀.
+                    if (os.environ.get("ASAP_WRAPPER_SEMANTICS", "1") or "1").strip() != "0":
                         corrob = _field_tokens(
                             product_facts,
                             "identity_hints.identity_terms;"
                             "identity_hints.product_form_terms;"
                             "identity_hints.normalized_tariff_description",
                         )
-                        if not any(tk.startswith(("stuff", "fill")) for tk in corrob):
-                            break  # 레지스터 미적용 → lexical 폴백
-                    if flag is True:
-                        verdict, why, pol_done = "true", f"field_hit:{leaf}", True
-                    elif flag is False:
-                        # False 위반의 거울상 가드: 정체 lane이 해당 어휘를
-                        # 긍정 서술하는데 boolean만 False면 두 lane의 모순
-                        # (파서 미충전 가능성) — 위반 대신 lexical 폴백.
-                        # 실측: 군만두 wrapper=False 오충전이 identity의
-                        # 'stuffed pasta' 4증거를 -100으로 뒤집어 190219 어부지리.
-                        # 같은 ASAP_WRAPPER_SEMANTICS 게이트로 복귀.
-                        if (os.environ.get("ASAP_WRAPPER_SEMANTICS", "1") or "1").strip() != "0":
-                            corrob = _field_tokens(
-                                product_facts,
-                                "identity_hints.identity_terms;"
-                                "identity_hints.product_form_terms;"
-                                "identity_hints.normalized_tariff_description",
-                            )
-                            prefixes = tuple({tok[:5] for tok in register})
-                            if any(tk.startswith(prefixes) for tk in corrob):
-                                break  # lane 모순 — 레지스터 미적용
-                        verdict, why, pol_done = "false", f"polarity:{leaf}=False", True
-                    break
-                # A. un-/non- 형태론: typed 상태 필드와의 극성 충돌만 위반
-                if not pol_done:
-                    state_toks = _field_tokens(
-                        product_facts,
-                        "identity_hints.processing_state;composition_facts.processing_state",
-                    )
-                    if state_toks and _polarity_conflict(all_value_toks, state_toks):
-                        verdict, why, pol_done = "false", "polarity:morphology", True
-                if pol_done:
-                    answers.append(verdict)
-                    detail.append({"cond": cond_type, "op": op, "verdict": verdict,
-                                   "field": dto_field.split(";")[0][:40], "why": why,
-                                   "value": str(cond.get("value") or "")[:80],
-                                   **binding_trace})
-                    continue
+                        prefixes = tuple({tok[:5] for tok in register})
+                        if any(tk.startswith(prefixes) for tk in corrob):
+                            break  # lane 모순 — 레지스터 미적용
+                    verdict, why, pol_done = "false", f"polarity:{leaf}=False", True
+                break
+            # A. un-/non- 형태론: typed 상태 필드와의 극성 충돌만 위반
+            if not pol_done:
+                state_toks = _field_tokens(
+                    product_facts,
+                    "identity_hints.processing_state;composition_facts.processing_state",
+                )
+                if state_toks and _polarity_conflict(all_value_toks, state_toks):
+                    verdict, why, pol_done = "false", "polarity:morphology", True
+            if pol_done:
+                answers.append(verdict)
+                detail.append({"cond": cond_type, "op": op, "verdict": verdict,
+                               "field": dto_field.split(";")[0][:40], "why": why,
+                               "value": str(cond.get("value") or "")[:80],
+                               **binding_trace})
+                continue
             if cond_type in _ALIAS_AXES and cond_type != "species_source":
                 alias = _aliases()
                 bound = bound | {c for t in bound for c in alias.get(t, ())}
@@ -708,13 +745,23 @@ def EvaluateCodeDecision(
         if canonical_closed_world:
             # The compiled decision row already binds the legal question to a
             # canonical DTO field. A direct field match (or an answered
-            # quantitative gate) is therefore sufficient authority; the
-            # legacy empirical binding-v1 table must not veto it.
+            # signed polarity fact, or an answered quantitative gate) is
+            # therefore sufficient authority; the legacy empirical
+            # binding-v1 table must not veto it.
+            signed_canonical_why = {
+                "affirmative_source_text",
+                "explicit_negation",
+                "processing_state_equivalent",
+            }
             typed_ok = any(
                 (d["op"] == "quant_gate" and d["verdict"] == "true")
                 or (
                     d["verdict"] == "true"
-                    and str(d.get("why") or "").startswith("field_hit:")
+                    and (
+                        str(d.get("why") or "").startswith("field_hit:")
+                        or str(d.get("why") or "").split(";", 1)[0]
+                        in signed_canonical_why
+                    )
                 )
                 for d in detail
             )

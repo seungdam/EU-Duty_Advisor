@@ -229,6 +229,10 @@ def _ApplyGri3Law(ranked: list, product_facts: dict,
     _barred = barred_families or set()
     gri_idx = [i_g for i_g, r_g in enumerate(ranked)
                if r_g.get("decision") == "confirmed"
+               and (
+                   not str(r_g.get("context_scope") or "").strip()
+                   or str(r_g.get("context_decision") or "") == "confirmed"
+               )
                and not any(str(r_g.get("code") or "").startswith(b_g)
                            for b_g in _barred)]
     if len(gri_idx) < 2:
@@ -823,19 +827,27 @@ class StagedClassificationTool:
                     decisions_by_parent=decisions_by_parent,
                     level=level,
                 )
-                # HS4 and HS6 use separate legal-question maps and entrypoints.
-                if level in ("hs4", "hs6"):
+                # Each legal level owns its reviewed axis map and public stamp.
+                if level in ("hs4", "hs6", "cn8"):
                     try:
                         from bussiness_logic.classification.services.axis_verdict import (
+                            StampCn8AxisVerdicts,
                             StampHs4AxisVerdicts,
                             StampHs6AxisVerdicts,
                         )
                         if level == "hs4":
                             StampHs4AxisVerdicts(ranked, product_facts)
-                        else:
+                        elif level == "hs6":
                             StampHs6AxisVerdicts(ranked, product_facts)
+                        else:
+                            StampCn8AxisVerdicts(ranked, product_facts)
                     except Exception:  # noqa: BLE001 — 축맵/모듈 부재 = off
                         pass
+                    self._apply_answer_overlays(
+                        ranked,
+                        product_facts,
+                        level=level,
+                    )
                 # [관측] 병합 게이트 observe 기록 수거 (순위 무영향 —
                 # 정렬로 부착 엔트리 위치가 바뀔 수 있어 전 엔트리 스캔)
                 for _e_obs in ranked:
@@ -1150,11 +1162,9 @@ class StagedClassificationTool:
                         "evidence_top_code": level_recoveries[0]["code"],
                         "evidence_top_score": level_recoveries[0]["score"],
                     })
-            # HS4/HS6 legal decisions must see every sibling. Lexical rank may
-            # limit CN8 retrieval temporarily, but cannot remove an upper-level
-            # branch before axis/verdict/GRI evaluation.
-            if level == "cn8":
-                ranked = ranked[: self.rank_top_k]
+            # Every legal level must see every sibling.  In particular, CN8
+            # cannot be truncated by the legacy lexical order before its
+            # canonical axis/verdict and GRI 6 authority are evaluated.
             # [12회차 §2-B] GRI 3 계단 — **다중 확정(같은 레벨 confirmed
             # ≥2)일 때만** 그 확정들 사이 서열을 법정 규칙으로 정한다
             # (점수 무관·이산·순서 고정 3(a)→3(b)→3(c)). 확정 0~1이면
@@ -1187,7 +1197,7 @@ class StagedClassificationTool:
                 _demote_mark = sorted(_new_losers)
             else:
                 _demote_mark = None
-            if level in ("hs4", "hs6"):
+            if level in ("hs4", "hs6", "cn8"):
                 winner, authority = self._authoritative_selection(ranked)
                 if not winner:
                     question_options = self._question_options(
@@ -1196,6 +1206,23 @@ class StagedClassificationTool:
                         parents=parents,
                         bti_summons=bti_summons,
                     )
+                    decision_fallback = ""
+                    if not question_options:
+                        decision_fallback = (
+                            "gri3d_question_required"
+                            if level == "hs4"
+                            else "gri6d_question_required"
+                        )
+                        self._append_gri_d_question_details(
+                            ranked,
+                            level=level,
+                        )
+                        question_options = self._question_options(
+                            ranked,
+                            level=level,
+                            parents=parents,
+                            bti_summons=bti_summons,
+                        )
                     stage_trace = self._trace(
                         level,
                         ranked,
@@ -1206,6 +1233,8 @@ class StagedClassificationTool:
                     )
                     stage_trace["selection_authority"] = "none"
                     stage_trace["question_options"] = question_options
+                    if decision_fallback:
+                        stage_trace["decision_fallback"] = decision_fallback
                     stages.append(stage_trace)
                     return self._unresolved_result(
                         level=level,
@@ -1235,32 +1264,6 @@ class StagedClassificationTool:
                 parent_scores = {winner: 1.0}
                 parents = selected
                 continue
-
-            # CN8 axis/verdict is not ready yet. Lexical ranking remains only
-            # inside the single, already-authoritative HS6 parent.
-            selected = self._select_keep(ranked)
-            if not selected:
-                selected = [ranked[0]["code"]]
-            stage_trace = self._trace(
-                level,
-                ranked,
-                selected,
-                level_facts,
-                "temporary_lexical",
-                engine="branch_index" if branch_rows else "cn_table",
-            )
-            stage_trace["selection_authority"] = "lexical_cn8_temporary"
-            stage_trace["upper_prefix_locked"] = parents[0] if len(parents) == 1 else ""
-            stages.append(stage_trace)
-            ranked_scores = {
-                row["code"]: float(row.get("score") or 0.0) for row in ranked
-            }
-            level_score_maps[level] = ranked_scores
-            parent_scores = {
-                code: ranked_scores.get(code, 0.0) for code in selected
-            }
-            parents = selected
-            continue
 
         candidates = self._final_candidates(parents, top_k=top_k)
         # [I §2] ★판례 우세 조항 (설계자 확정 07-20 — 등급제의 유일한
@@ -1629,7 +1632,7 @@ class StagedClassificationTool:
 
         parent_rank = {p: i for i, p in enumerate(parent_order)}
         scores_by_parent = parent_scores or {}
-        discrete_only = level in ("hs4", "hs6")
+        discrete_only = level in ("hs4", "hs6", "cn8")
         merged: list[dict[str, Any]] = []
         fam_entries: dict[str, list[dict[str, Any]]] = {}
         for parent, items in groups.items():
@@ -1657,7 +1660,7 @@ class StagedClassificationTool:
                 merged.append(entry)
 
         if discrete_only:
-            # HS4/HS6 are closed sibling decisions. Parent order and source
+            # HS4/HS6/CN8 are closed sibling decisions. Parent order and source
             # branch order are retained only for deterministic presentation;
             # neither lexical overlap nor inherited parent score can select a
             # child. `_authoritative_selection` consumes only O/X/SILENCE,
@@ -1827,15 +1830,29 @@ class StagedClassificationTool:
         is nothing to discriminate). Residuals never win by wording.
         """
         context_scope_by_code: dict[str, str] = {}
-        if discrete_only and level == "hs6":
+        if discrete_only and level in ("hs6", "cn8"):
             for item in items:
                 row = item["row"]
-                code = _digits(row.get("code"), limit=6)
+                code = _digits(
+                    row.get("code"),
+                    limit=8 if level == "cn8" else 6,
+                )
                 context = re.sub(
                     r"\s+",
                     " ",
                     str(row.get("branch_context") or ""),
                 ).strip()
+                if level == "cn8" and not context:
+                    try:
+                        from bussiness_logic.classification.services.axis_verdict import (
+                            GetCn8AxisRecord,
+                        )
+
+                        context = str(
+                            GetCn8AxisRecord(code).get("context_scope") or ""
+                        ).strip()
+                    except Exception:  # noqa: BLE001 — map absence = no context
+                        context = ""
                 if context.lower() in ("", "other", "n/a", "none"):
                     continue
                 context_scope_by_code[code] = context
@@ -2040,9 +2057,11 @@ class StagedClassificationTool:
             decision_detail: list[dict[str, str]] = []
             raw_code_conditions = (group_decisions or {}).get(code)
             code_conditions = raw_code_conditions
+            context_conditions: list[dict[str, Any]] = []
             context_scope = context_scope_by_code.get(code, "")
             context_decision = ""
             context_detail: list[dict[str, str]] = []
+            context_observation: dict[str, Any] = {}
             primary_axis = ""
             if discrete_only and raw_code_conditions:
                 from bussiness_logic.classification.services.axis_verdict import (
@@ -2054,19 +2073,62 @@ class StagedClassificationTool:
                     code,
                     list(raw_code_conditions),
                 )
-            if code_conditions:
+                # Compiler qualifier rows describe the intermediate suffix
+                # context. They do not vote on the leaf, but they can answer the
+                # context gate through the same canonical binding evaluator.
+                context_conditions = [
+                    {
+                        **dict(condition),
+                        "role": "",
+                    }
+                    for condition in raw_code_conditions
+                    if str(condition.get("role") or "").strip() == "qualifier"
+                ]
+            if code_conditions or context_conditions:
                 from bussiness_logic.classification.rules.branch_decision_evaluator import EvaluateCodeDecision
 
             if context_scope:
-                context_decision = "undecided"
-                context_detail = [{
-                    "cond": "branch_context",
-                    "op": "context_question",
-                    "verdict": "silent",
-                    "field": "",
-                    "why": "context_question_not_compiled",
-                    "value": json.dumps([context_scope]),
-                }]
+                from bussiness_logic.classification.rules.branch_context_evaluator import (
+                    ObserveBranchContext,
+                )
+
+                context_observation = ObserveBranchContext(
+                    context_scope,
+                    product_facts,
+                )
+                if context_conditions:
+                    context_decision, context_detail = EvaluateCodeDecision(
+                        context_conditions,
+                        product_facts,
+                        frozenset(),
+                        percentages,
+                        _quantitative_verdict,
+                        canonical_closed_world=True,
+                    )
+                    for detail in context_detail:
+                        detail["context_scope"] = context_scope
+                else:
+                    context_decision = "undecided"
+                    context_detail = [{
+                        "cond": "branch_context",
+                        "op": "context_question",
+                        "verdict": "silent",
+                        "field": "",
+                        "why": "context_question_not_compiled",
+                        "value": json.dumps([context_scope]),
+                    }]
+                (
+                    observed_context_decision,
+                    observed_context_detail,
+                ) = self._consume_context_observation(
+                    context_observation,
+                )
+                if (
+                    observed_context_decision != "undecided"
+                    or context_decision != "confirmed"
+                ):
+                    context_decision = observed_context_decision
+                    context_detail = observed_context_detail
             if code_conditions:
                 decision_status, decision_detail = EvaluateCodeDecision(
                     code_conditions,
@@ -2228,6 +2290,7 @@ class StagedClassificationTool:
                 "context_scope": context_scope,
                 "context_decision": context_decision,
                 "context_detail": context_detail,
+                "context_observation": context_observation,
                 "quantitative_verdict": verdict,
             })
 
@@ -2598,6 +2661,240 @@ class StagedClassificationTool:
         return [r["code"] for r in ranked[: self.keep_per_level]]
 
     @staticmethod
+    def _apply_answer_overlays(
+        ranked: list[dict[str, Any]],
+        product_facts: dict[str, Any],
+        *,
+        level: str,
+    ) -> None:
+        """Apply answers to questions added by the post-rank axis stamp."""
+        from bussiness_logic.classification.rules.question_contract import (
+            ApplyClassificationAnswers,
+            FindClassificationAnswer,
+            NormalizeClassificationAnswer,
+        )
+
+        for row in ranked:
+            code = str(row.get("code") or "")
+            if not code:
+                continue
+            parent_code = code[:-2]
+            context_scope = str(row.get("context_scope") or "")
+            details = list(row.get("decision_detail") or [])
+            gri_d_detail = StagedClassificationTool._gri_d_question_detail(
+                row,
+                level=level,
+            )
+            gri_d_key = StagedClassificationTool._question_key_for_detail(
+                row,
+                gri_d_detail,
+                level=level,
+            )
+            gri_d_answer = FindClassificationAnswer(
+                product_facts,
+                questionKey=gri_d_key,
+            )
+            if (
+                gri_d_answer
+                and not any(
+                    str(detail.get("why") or "")
+                    == str(gri_d_detail.get("why") or "")
+                    for detail in details
+                    if isinstance(detail, dict)
+                )
+            ):
+                details.append(gri_d_detail)
+                row["decision_detail"] = details
+            if details:
+                row["decision"], row["decision_detail"], _ = (
+                    ApplyClassificationAnswers(
+                        decisionStatus=str(row.get("decision") or ""),
+                        decisionDetail=details,
+                        productFacts=product_facts,
+                        stage=level,
+                        parentCode=parent_code,
+                        candidateCode=code,
+                        contextScope=context_scope,
+                    )
+                )
+            context_details = row.get("context_detail") or []
+            if context_details:
+                row["context_decision"], row["context_detail"], _ = (
+                    ApplyClassificationAnswers(
+                        decisionStatus=str(row.get("context_decision") or ""),
+                        decisionDetail=context_details,
+                        productFacts=product_facts,
+                        stage=level,
+                        parentCode=parent_code,
+                        candidateCode=code,
+                        contextScope=context_scope,
+                    )
+                )
+            if gri_d_answer:
+                normalized_answer = NormalizeClassificationAnswer(
+                    gri_d_answer.get("answer"),
+                )
+                if normalized_answer == "yes":
+                    row["decision"] = "confirmed"
+                    if context_scope:
+                        row["context_decision"] = "confirmed"
+                elif normalized_answer == "no":
+                    row["decision"] = "violated"
+
+    @staticmethod
+    def _gri_d_question_detail(
+        row: dict[str, Any],
+        *,
+        level: str,
+    ) -> dict[str, Any]:
+        rule = "gri3d" if level == "hs4" else "gri6d"
+        description = str(row.get("descr") or row.get("code") or "")
+        return {
+            "cond": "classification_branch",
+            "op": "axis_verdict",
+            "verdict": "silent",
+            "field": "",
+            "why": f"{rule}:no_authoritative_selection_or_bti",
+            "value": description,
+            "binding_axis": "classification_branch",
+            "authority": "explicit_user_answer_required",
+        }
+
+    @staticmethod
+    def _question_key_for_detail(
+        row: dict[str, Any],
+        detail: dict[str, Any],
+        *,
+        level: str,
+    ) -> str:
+        from bussiness_logic.classification.rules.question_contract import (
+            BuildClassificationQuestionKey,
+            ResolveQuestionCandidateCode,
+        )
+
+        code = str(row.get("code") or "")
+        parent_code = code[:-2]
+        context_scope = str(row.get("context_scope") or "")
+        candidate_code = ResolveQuestionCandidateCode(
+            detail,
+            parentCode=parent_code,
+            candidateCode=code,
+            contextScope=context_scope,
+        )
+        return BuildClassificationQuestionKey(
+            stage=level,
+            parentCode=parent_code,
+            candidateCode=candidate_code,
+            axis=str(
+                detail.get("binding_axis")
+                or detail.get("axis")
+                or detail.get("cond")
+                or ""
+            ),
+            canonicalField=str(detail.get("field") or ""),
+            conditionValue=detail.get("value"),
+            predicateOp=str(detail.get("op") or "axis_verdict"),
+            contextScope=context_scope,
+        )
+
+    @staticmethod
+    def _append_gri_d_question_details(
+        ranked: list[dict[str, Any]],
+        *,
+        level: str,
+    ) -> int:
+        """Expose a final-stage question when GRI/BTI has no legal winner."""
+        appended = 0
+        review_rows = [
+            row for row in ranked
+            if str(row.get("decision") or "") != "violated"
+            and str(row.get("context_decision") or "") != "violated"
+        ]
+        if not review_rows:
+            review_rows = ranked
+        for row in review_rows:
+            detail = StagedClassificationTool._gri_d_question_detail(
+                row,
+                level=level,
+            )
+            details = [
+                dict(item)
+                for item in (row.get("decision_detail") or [])
+                if isinstance(item, dict)
+            ]
+            if any(
+                str(item.get("why") or "") == str(detail.get("why") or "")
+                for item in details
+            ):
+                continue
+            details.append(detail)
+            row["decision_detail"] = details
+            appended += 1
+        return appended
+
+    @staticmethod
+    def _consume_context_observation(
+            observation: dict[str, Any],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Translate a validated observation into context O/X/SILENCE.
+
+        It replaces only the intermediate context verdict; leaf decisions and
+        every ancestor selection remain untouched.
+        """
+        verdict = str(observation.get("verdict") or "SILENCE").upper()
+        status = {
+            "O": "confirmed",
+            "X": "violated",
+        }.get(verdict, "undecided")
+        details = []
+        for condition in observation.get("conditions") or []:
+            condition_verdict = str(
+                condition.get("verdict") or "SILENCE"
+            ).upper()
+            details.append({
+                "cond": str(condition.get("axis") or "branch_context"),
+                "op": (
+                    "not_contains"
+                    if str(condition.get("expected") or "") == "not"
+                    else "context_observation"
+                ),
+                "verdict": {
+                    "O": "true",
+                    "X": "false",
+                }.get(condition_verdict, "silent"),
+                "field": str(condition.get("canonical_field") or ""),
+                "why": (
+                    "context_observation:"
+                    + str(condition.get("reason") or "unanswered")
+                ),
+                "value": json.dumps(
+                    [condition.get("value")],
+                    ensure_ascii=False,
+                ),
+                "context_scope": str(
+                    observation.get("context_scope") or ""
+                ),
+                "authority": "canonical_context",
+            })
+        if not details:
+            details.append({
+                "cond": "branch_context",
+                "op": "context_observation",
+                "verdict": "silent",
+                "field": "",
+                "why": "context_observation:empty_context",
+                "value": json.dumps(
+                    [observation.get("context_scope") or ""],
+                    ensure_ascii=False,
+                ),
+                "context_scope": str(
+                    observation.get("context_scope") or ""
+                ),
+                "authority": "canonical_context",
+            })
+        return status, details
+
+    @staticmethod
     def _authoritative_selection(
             ranked: list[dict[str, Any]],
     ) -> tuple[str, str]:
@@ -2610,6 +2907,10 @@ class StagedClassificationTool:
         confirmed = [
             row for row in eligible
             if str(row.get("decision") or "") == "confirmed"
+            and (
+                not str(row.get("context_scope") or "").strip()
+                or str(row.get("context_decision") or "") == "confirmed"
+            )
         ]
         if len(confirmed) == 1:
             return str(confirmed[0].get("code") or ""), "confirmed"
@@ -2657,13 +2958,59 @@ class StagedClassificationTool:
         if len(context_residuals) > 1:
             return "", "multiple_context_residuals_without_gri"
 
+        # An explicit user answer may confirm the suffix context carried by a
+        # residual leaf even when the source rows do not repeat that context on
+        # every named sibling. Once every named sibling is X, that confirmed
+        # context is stronger than an unscoped "Other" residual.
+        specific_rows = [row for row in ranked if not bool(row.get("residual"))]
+        context_answered_residuals = [
+            row
+            for row in eligible
+            if bool(row.get("residual"))
+            and str(row.get("context_decision") or "") == "confirmed"
+        ]
+        if (
+            len(context_answered_residuals) == 1
+            and specific_rows
+            and all(
+                str(row.get("decision") or "") == "violated"
+                for row in specific_rows
+            )
+        ):
+            return (
+                str(context_answered_residuals[0].get("code") or ""),
+                "explicit_context_residual_elimination",
+            )
+        if len(context_answered_residuals) > 1:
+            return "", "multiple_answered_context_residuals_without_gri"
+
+        # A global/unscoped "Other" cannot bypass an unresolved suffix
+        # subtree. The context must first be proven X, or be resolved to one of
+        # its own leaves, before the parent-level residual becomes eligible.
+        open_scoped_rows = [
+            row
+            for row in ranked
+            if str(row.get("context_scope") or "").strip()
+            and str(row.get("context_decision") or "") != "violated"
+            and str(row.get("decision") or "") != "violated"
+        ]
+        if open_scoped_rows:
+            return "", "none"
+
         # "Other" can be authoritative only when elimination was actually
         # completed, or when the axis evaluator directly answered its question.
-        residual_rows = [row for row in ranked if bool(row.get("residual"))]
-        specific_rows = [row for row in ranked if not bool(row.get("residual"))]
-        explicit_elimination = bool(specific_rows) and all(
+        residual_rows = [
+            row for row in ranked
+            if bool(row.get("residual"))
+            and not str(row.get("context_scope") or "").strip()
+        ]
+        unscoped_specific_rows = [
+            row for row in specific_rows
+            if not str(row.get("context_scope") or "").strip()
+        ]
+        explicit_elimination = bool(unscoped_specific_rows) and all(
             str(row.get("decision") or "") == "violated"
-            for row in specific_rows
+            for row in unscoped_specific_rows
         )
         residual = []
         for row in residual_rows:
@@ -2700,10 +3047,12 @@ class StagedClassificationTool:
         from bussiness_logic.classification.rules.question_contract import (
             BuildClassificationQuestionKey,
             QUESTION_CONTRACT_VERSION,
+            ResolveQuestionCandidateCode,
         )
 
         options: list[dict[str, Any]] = []
         seen_keys: set[str] = set()
+        answered_axis_fields: set[tuple[str, str, str, str, str]] = set()
         bti_fields = (
             "level",
             "code",
@@ -2730,19 +3079,43 @@ class StagedClassificationTool:
             if str(item.get("level") or "") == level
         ]
         for row in ranked:
-            if str(row.get("decision") or "") == "violated":
-                continue
-            details = [
+            automatic_violation = (
+                str(row.get("decision") or "") == "violated"
+                or str(row.get("context_decision") or "") == "violated"
+            )
+            decision_details = [
                 dict(item)
-                for item in (
-                        list(row.get("decision_detail") or [])
-                        + list(row.get("predicate_results") or [])
-                )
+                for item in list(row.get("decision_detail") or [])
                 if isinstance(item, dict)
                    and str(item.get("op") or "") != "user_answer"
                    and str(item.get("verdict") or "").lower()
                    in ("", "unknown", "undecided", "silent")
             ]
+            gri_d_details = [
+                detail
+                for detail in decision_details
+                if str(detail.get("why") or "").startswith(
+                    ("gri3d:", "gri6d:"),
+                )
+            ]
+            if automatic_violation:
+                if not gri_d_details:
+                    continue
+                decision_details = gri_d_details
+            predicate_details = [
+                dict(item)
+                for item in list(row.get("predicate_results") or [])
+                if isinstance(item, dict)
+                   and str(item.get("op") or "") != "user_answer"
+                   and str(item.get("verdict") or "").lower()
+                   in ("", "unknown", "undecided", "silent")
+            ]
+            if automatic_violation:
+                predicate_details = []
+            # The decision table is the primary legal question source.
+            # Predicates are a fallback only when no actionable decision-table
+            # question exists for this candidate.
+            details = decision_details or predicate_details
             if str(row.get("context_decision") or "") == "undecided":
                 details.extend(
                     dict(item)
@@ -2785,10 +3158,32 @@ class StagedClassificationTool:
                     str(detail.get("op") or "").strip().lower()
                     or "affirmative"
                 )
+                question_candidate_code = ResolveQuestionCandidateCode(
+                    detail,
+                    parentCode=parent_code,
+                    candidateCode=code,
+                    contextScope=context_scope,
+                )
+                axis_field_key = (
+                    level,
+                    parent_code,
+                    code,
+                    axis,
+                    canonical_field,
+                )
+                # A late axis stamp summarizes the same legal question already
+                # emitted by a compiled condition for this candidate.  Keep the
+                # concrete condition and suppress only the duplicate summary;
+                # distinct values on the same axis remain separate questions.
+                if (
+                    predicate_op == "axis_verdict"
+                    and axis_field_key in answered_axis_fields
+                ):
+                    continue
                 question_key = BuildClassificationQuestionKey(
                     stage=level,
                     parentCode=parent_code,
-                    candidateCode=code,
+                    candidateCode=question_candidate_code,
                     axis=axis,
                     canonicalField=canonical_field,
                     conditionValue=detail.get("value"),
@@ -2798,6 +3193,8 @@ class StagedClassificationTool:
                 if question_key in seen_keys:
                     continue
                 seen_keys.add(question_key)
+                if predicate_op != "axis_verdict":
+                    answered_axis_fields.add(axis_field_key)
                 if condition in ("material_composition", "contains", "species_source"):
                     subject = ", ".join(values) or description
                     question_text = f"제품에 다음 성분 또는 종이 포함되어 있습니까: {subject}?"
@@ -3087,6 +3484,7 @@ class StagedClassificationTool:
             "candidates_considered": [
                 {
                     "code": r["code"],
+                    "description": str(r.get("descr") or ""),
                     "score": r["score"],
                     "matched_terms": r.get("matched", []),
                     "negative_matched_terms": r.get("neg_matched", []),
@@ -3096,6 +3494,10 @@ class StagedClassificationTool:
                     "context_scope": r.get("context_scope", ""),
                     "context_decision": r.get("context_decision", ""),
                     "context_detail": r.get("context_detail", []),
+                    "context_observation": r.get("context_observation", {}),
+                    "axis_parent_code": r.get("axis_parent_code", ""),
+                    "axis_parent_level": r.get("axis_parent_level", ""),
+                    "axis_runtime_parent": r.get("axis_runtime_parent", ""),
                     "precedent_tiebreak": r.get("precedent_tiebreak"),
                     "quantitative_verdict": (r.get("quantitative_verdict") or {}).get("verdict", "neutral"),
                     # [기록 의무화 07-18 — 메인 그래프트 재이식] 잔반·형태

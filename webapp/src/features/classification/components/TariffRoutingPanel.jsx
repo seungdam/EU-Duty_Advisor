@@ -39,7 +39,7 @@ export default function TariffRoutingPanel({ result }) {
         .map((field) => AUTHORITY_LABELS[clean(field)] || clean(field).replaceAll("_", " "))
         .filter(Boolean),
     };
-  });
+  }).slice(0, 3);
   const missingFacts = asList(routingView.missing_facts).map(FactLabel);
   const topChapter = chapterDetails[0];
 
@@ -69,7 +69,7 @@ export default function TariffRoutingPanel({ result }) {
           </div>
           <DataTable
             rows={chapterDetails}
-            limit={5}
+            limit={3}
             className="cjs-routing-table"
             columns={[
               { key: "rank", label: "순서", variant: "mono" },
